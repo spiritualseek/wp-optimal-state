@@ -1,12 +1,10 @@
 <?php
 /**
- * WP Optimal State - Uninstall Script (Enhanced)
- * 
- * This file is executed when the plugin is uninstalled.
+ * WP Optimal State - Uninstall Script
+ * * This file is executed when the plugin is uninstalled.
  * It cleans up all plugin data from the database.
- * 
- * @package WP_Optimal_State
- * @version 1.0.3
+ * * @package WP_Optimal_State
+ * @version 1.0.4
  */
 
 // Prevent direct access
@@ -24,8 +22,7 @@ $is_multisite = is_multisite();
 
 /**
  * Check if we should remove data on uninstall
- * 
- * This respects the user's choice if they have a setting for data removal.
+ * * This respects the user's choice if they have a setting for data removal.
  * By default, we remove all plugin data.
  */
 function wp_opt_state_should_remove_data() {
@@ -117,25 +114,8 @@ function wp_opt_state_uninstall_cleanup() {
         wp_cache_flush();
     }
     
-    // Remove any custom database tables (if you add any in future versions)
-    // Example: 
-    // $table_name = $wpdb->prefix . 'wp_opt_state_logs';
-    // $wpdb->query($wpdb->prepare('DROP TABLE IF EXISTS %s', $table_name));
-    
     // Remove any custom user meta
     $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE 'wp_opt_state_%'");
-    
-    /**
-     * Additional cleanup actions
-     * 
-     * Note: We don't clean up the actual database tables that were optimized
-     * as those are core WordPress tables. We only remove our own plugin data.
-     */
-    
-    // Log the uninstall for debugging (only in debug mode)
-    if (defined('WP_DEBUG') && WP_DEBUG === true) {
-        error_log('WP Optimal State plugin uninstalled and data cleaned up at ' . current_time('mysql'));
-    }
     
     /**
      * Fire action hook for developers to add custom cleanup
@@ -210,37 +190,3 @@ try {
     // Don't throw the exception to prevent WordPress from showing errors to users
     return;
 }
-
-/**
- * Note for developers:
- * 
- * This uninstall script follows WordPress coding standards and best practices:
- * 1. ✓ Checks WP_UNINSTALL_PLUGIN constant for security
- * 2. ✓ Verifies user capabilities before proceeding
- * 3. ✓ Provides full multisite support with blog switching
- * 4. ✓ Respects user preferences for data retention
- * 5. ✓ Cleans up all plugin-generated data (options, transients, scheduled events)
- * 6. ✓ Uses proper error handling and logging (debug mode only)
- * 7. ✓ Follows WordPress database interaction patterns with prepared statements
- * 8. ✓ Uses action hooks for extensibility
- * 9. ✓ Includes try-catch for error handling
- * 10. ✓ Uses esc_like() for SQL LIKE queries to prevent SQL injection
- * 11. ✓ Handles both regular and site transients
- * 12. ✓ Cleans up user meta data
- * 13. ✓ Properly restores blog context in multisite
- * 14. ✓ Includes additional security checks
- * 
- * The script does NOT:
- * - Remove any core WordPress data
- * - Delete posts, comments, or user data
- * - Modify any content created by users
- * - Leave any orphaned data in the database
- * - Perform any operations without proper sanitization
- * 
- * Security considerations:
- * - All database queries use prepared statements
- * - User permissions are checked before execution
- * - WordPress constants are verified for proper context
- * - Error messages are only logged in debug mode
- * - No direct SQL injection points exist
- */

@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: WP Optimal State
+ * Plugin Name: WP Optimal State ✔
  * Plugin URI: https://spiritualseek.com/wp-optimal-state-wordpress-plugin/
- * Description: Advanced WordPress optimization and cleaning plugin. It cleans your database, optimizes your tables, removes old and unused data, and keeps your site lightning fast.
- * Version: 1.0.3
+ * Description: Advanced WordPress optimization and cleaning plugin with an integrated database backup manager. It cleans your database, optimizes your tables, and allows you to create, restore, and manage database backups.
+ * Version: 1.0.7
  * Author: Luke Garrison / The Spiritual Seek
  * Author URI: https://spiritualseek.com/
  * License: GPL v2 or later
@@ -26,15 +26,33 @@ if (!defined('ABSPATH')) {
 class WP_Optimal_State {
     
     private $plugin_name = 'WP Optimal State';
-    private $version = '1.0.3';
+    private $version = '1.0.7';
     private $option_name = 'wp_opt_state_settings';
     private $nonce_action = 'wp_opt_state_nonce';
+    private $db_backup_manager;
+    private $log_option_name = 'wp_opt_state_optimization_log';
     
     public function __construct() {
+        // Instantiate the backup manager and let it handle its own hooks
+        $this->db_backup_manager = new DB_Backup_Manager();
+
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
         add_action('plugins_loaded', array($this, 'load_textdomain'));
+        add_action('admin_notices', 'wp_opt_state_admin_notices');
+function wp_opt_state_admin_notices() {
+    if (isset($_GET['page']) && $_GET['page'] === 'wp-optimal-state' && isset($_GET['settings-updated'])) {
+        ?>
+        <div class="notice notice-success is-dismissible">
+            <p><?php esc_html_e('Settings saved successfully!', 'wp-optimal-state'); ?></p>
+        </div>
+        <?php
+    }
+}
         $this->register_ajax_handlers();
+        add_action('wp_opt_state_scheduled_cleanup', array($this, 'run_scheduled_cleanup'));
+        add_action('update_option_wp_opt_state_settings', array($this, 'handle_settings_update'), 10, 3);
+        add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
     }
     
     /**
@@ -45,20 +63,19 @@ class WP_Optimal_State {
     }
     
     /**
-     * Register all AJAX handlers
+     * Register all AJAX handlers for the optimization features
      */
-    private function register_ajax_handlers() {
-        $handlers = array(
-            'get_stats', 'clean_item', 'optimize_tables', 
-            'one_click_optimize', 'get_db_size', 'clean_old_revisions', 
-            'optimize_autoload', 'analyze_repair_tables'
-        );
+private function register_ajax_handlers() {
+    $handlers = array(
+        'get_stats', 'clean_item', 'optimize_tables', 
+        'one_click_optimize', 'get_db_size', 
+        'optimize_autoload', 'analyze_repair_tables',
+        'get_optimization_log', 'save_max_backups'
+    );
         
         foreach ($handlers as $handler) {
             add_action('wp_ajax_wp_opt_state_' . $handler, array($this, 'ajax_' . $handler));
         }
-        
-        add_action('wp_opt_state_scheduled_cleanup', array($this, 'run_scheduled_cleanup'));
     }
     
     /**
@@ -77,511 +94,219 @@ class WP_Optimal_State {
     }
     
     /**
-     * Enqueue admin styles and scripts
+     * Enqueue combined admin styles and scripts
      */
     public function enqueue_admin_assets($hook) {
         if ($hook !== 'toplevel_page_wp-optimal-state') {
             return;
         }
         
+        // Enqueue the combined CSS file
         wp_enqueue_style(
             'wp-opt-state-admin-styles',
-            plugin_dir_url(__FILE__) . 'css/admin-styles.css',
+            plugin_dir_url(__FILE__) . 'css/admin.css',
             array(),
             $this->version
         );
         
-        wp_enqueue_script('jquery');
-        add_action('admin_footer', array($this, 'output_inline_scripts'));
-    }
-    
-    /**
-     * Output inline JavaScript for AJAX functionality
-     */
-    public function output_inline_scripts() {
-        $labels = array(
-            'post_revisions' => __('Post Revisions', 'wp-optimal-state'),
-            'auto_drafts' => __('Auto Drafts', 'wp-optimal-state'),
-            'trashed_posts' => __('Trashed Posts', 'wp-optimal-state'),
-            'spam_comments' => __('Spam Comments', 'wp-optimal-state'),
-            'trashed_comments' => __('Trashed Comments', 'wp-optimal-state'),
-            'orphaned_postmeta' => __('Orphaned Post Meta', 'wp-optimal-state'),
-            'orphaned_commentmeta' => __('Orphaned Comment Meta', 'wp-optimal-state'),
-            'expired_transients' => __('Expired Transients', 'wp-optimal-state'),
-            'all_transients' => __('All Transients', 'wp-optimal-state'),
-            'autoload_options' => __('Autoloaded Options', 'wp-optimal-state'),
-            'autoload_size' => __('Autoload Size', 'wp-optimal-state')
+        // Enqueue the combined JavaScript file
+        wp_enqueue_script(
+            'wp-opt-state-admin-script',
+            plugin_dir_url(__FILE__) . 'js/admin.js',
+            array('jquery'),
+            $this->version,
+            true
         );
-        ?>
-        <script type="text/javascript">
-        jQuery(document).ready(function($) {
-            'use strict';
-            
-            var wpOptStateAjax = {
-                ajaxurl: <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>,
-                nonce: <?php echo wp_json_encode(wp_create_nonce($this->nonce_action)); ?>,
-                isProcessing: false
-            };
-            
-            var labels = <?php echo wp_json_encode($labels); ?>;
-            
-            function showModal(title, message, onConfirm, isDanger) {
-                var $overlay = $('<div class="wp-opt-state-modal-overlay"></div>');
-                var dangerClass = isDanger ? ' wp-opt-state-modal-danger' : '';
-                var $modal = $('<div class="wp-opt-state-modal' + dangerClass + '">' +
-                              '<div class="wp-opt-state-modal-header">' +
-                              '<h3>' + title + '</h3>' +
-                              '<button class="wp-opt-state-modal-close">&times;</button>' +
-                              '</div>' +
-                              '<div class="wp-opt-state-modal-body">' + message + '</div>' +
-                              '<div class="wp-opt-state-modal-footer">' +
-                              '<button class="button wp-opt-state-modal-cancel"><?php echo esc_js(__('Cancel', 'wp-optimal-state')); ?></button>' +
-                              '<button class="button button-primary wp-opt-state-modal-confirm"><?php echo esc_js(__('Confirm', 'wp-optimal-state')); ?></button>' +
-                              '</div>' +
-                              '</div>');
-                
-                $('body').append($overlay).append($modal);
-                
-                setTimeout(function() {
-                    $overlay.addClass('show');
-                    $modal.addClass('show');
-                }, 10);
-                
-                function closeModal() {
-                    $overlay.removeClass('show');
-                    $modal.removeClass('show');
-                    setTimeout(function() {
-                        $overlay.remove();
-                        $modal.remove();
-                    }, 300);
-                }
-                
-                $modal.find('.wp-opt-state-modal-close, .wp-opt-state-modal-cancel').on('click', closeModal);
-                $overlay.on('click', closeModal);
-                
-                $modal.find('.wp-opt-state-modal-confirm').on('click', function() {
-                    closeModal();
-                    if (onConfirm) onConfirm();
-                });
-                
-                $modal.on('click', function(e) {
-                    e.stopPropagation();
-                });
-            }
-            
-            function showToast(message, type) {
-                type = type || 'success';
-                var $toast = $('<div class="wp-opt-state-toast wp-opt-state-toast-' + type + '">' + 
-                              '<span class="wp-opt-state-toast-icon"></span>' + message + '</div>');
-                $('body').append($toast);
-                
-                setTimeout(function() { $toast.addClass('show'); }, 100);
-                setTimeout(function() {
-                    $toast.removeClass('show');
-                    setTimeout(function() { $toast.remove(); }, 300);
-                }, 3000);
-            }
-            
-            function handleAjaxError(xhr, status, error) {
-                console.error('AJAX Error:', status, error);
-                showToast(<?php echo wp_json_encode(__('An error occurred. Please try again.', 'wp-optimal-state')); ?>, 'error');
-                wpOptStateAjax.isProcessing = false;
-            }
-            
-            function loadStats() {
-                $('#wp-opt-state-stats-loading').fadeIn(200);
-                $('#wp-opt-state-stats').empty();
-                
-                $.post(wpOptStateAjax.ajaxurl, {
-                    action: 'wp_opt_state_get_stats',
-                    nonce: wpOptStateAjax.nonce
-                })
-                .done(function(response) {
-                    $('#wp-opt-state-stats-loading').fadeOut(200);
-                    if (response.success && response.data) {
-                        displayStats(response.data);
-                        displayCleanupItems(response.data);
-                    } else {
-                        showToast(<?php echo wp_json_encode(__('Failed to load statistics', 'wp-optimal-state')); ?>, 'error');
-                    }
-                })
-                .fail(handleAjaxError);
-                
-                $.post(wpOptStateAjax.ajaxurl, {
-                    action: 'wp_opt_state_get_db_size',
-                    nonce: wpOptStateAjax.nonce
-                })
-                .done(function(response) {
-                    if (response.success && response.data) {
-                        $('#wp-opt-state-db-size-value').text(response.data.size);
-                    }
-                })
-                .fail(function() {
-                    $('#wp-opt-state-db-size-value').text(<?php echo wp_json_encode(__('Error', 'wp-optimal-state')); ?>);
-                });
-            }
-            
-            function displayStats(stats) {
-                var html = '';
-                for (var key in stats) {
-                    if (labels[key]) {
-                        html += '<div class="wp-opt-state-stat-item">' +
-                                '<div class="wp-opt-state-stat-label">' + labels[key] + '</div>' +
-                                '<div class="wp-opt-state-stat-value">' + stats[key] + '</div>' +
-                                '</div>';
-                    }
-                }
-                $('#wp-opt-state-stats').html(html).hide().fadeIn(300);
-            }
-            
-            function displayCleanupItems(stats) {
-                var items = [
-                    {key: 'post_revisions', title: <?php echo wp_json_encode(__('Post Revisions', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Old versions of posts and pages', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'auto_drafts', title: <?php echo wp_json_encode(__('Auto Drafts', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Automatically saved drafts', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'trashed_posts', title: <?php echo wp_json_encode(__('Trashed Posts', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Posts in trash', 'wp-optimal-state')); ?>, safe: false},
-                    {key: 'spam_comments', title: <?php echo wp_json_encode(__('Spam Comments', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Comments marked as spam', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'trashed_comments', title: <?php echo wp_json_encode(__('Trashed Comments', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Comments in trash', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'orphaned_postmeta', title: <?php echo wp_json_encode(__('Orphaned Post Meta', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Metadata for deleted posts', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'orphaned_commentmeta', title: <?php echo wp_json_encode(__('Orphaned Comment Meta', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Metadata for deleted comments', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'orphaned_relationships', title: <?php echo wp_json_encode(__('Orphaned Relationships', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Term relationships for deleted posts', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'expired_transients', title: <?php echo wp_json_encode(__('Expired Transients', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Expired temporary options', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'all_transients', title: <?php echo wp_json_encode(__('All Transients', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('All cached temporary data', 'wp-optimal-state')); ?>, safe: false},
-                    {key: 'duplicate_postmeta', title: <?php echo wp_json_encode(__('Duplicate Post Meta', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Duplicate metadata entries', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'duplicate_commentmeta', title: <?php echo wp_json_encode(__('Duplicate Comment Meta', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Duplicate comment metadata', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'orphaned_usermeta', title: <?php echo wp_json_encode(__('Orphaned User Meta', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Metadata for deleted users', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'unapproved_comments', title: <?php echo wp_json_encode(__('Unapproved Comments', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Comments awaiting moderation', 'wp-optimal-state')); ?>, safe: false},
-                    {key: 'pingbacks', title: <?php echo wp_json_encode(__('Pingbacks', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Pingback notifications', 'wp-optimal-state')); ?>, safe: true},
-                    {key: 'trackbacks', title: <?php echo wp_json_encode(__('Trackbacks', 'wp-optimal-state')); ?>, desc: <?php echo wp_json_encode(__('Trackback notifications', 'wp-optimal-state')); ?>, safe: true}
-                ];
-                
-                var html = '';
-                items.forEach(function(item) {
-                    var count = stats[item.key] || 0;
-                    var warningIcon = !item.safe ? '<span class="wp-opt-state-warning-icon" title="' + <?php echo wp_json_encode(__('Review before cleaning', 'wp-optimal-state')); ?> + '">⚠️</span>' : '';
-                    var disabled = count == 0 ? ' disabled' : '';
-                    var countClass = count > 0 ? 'has-items' : '';
-                    
-                    html += '<div class="wp-opt-state-cleanup-item ' + countClass + '">' +
-                            '<div class="wp-opt-state-cleanup-header">' +
-                            '<span class="wp-opt-state-cleanup-title">' + item.title + ' ' + warningIcon + '</span>' +
-                            '<span class="wp-opt-state-cleanup-count">' + count + '</span>' +
-                            '</div>' +
-                            '<div class="wp-opt-state-cleanup-desc">' + item.desc + '</div>' +
-                            '<button class="wp-opt-state-clean-btn" data-type="' + item.key + '" data-safe="' + item.safe + '"' + disabled + '>' +
-                            <?php echo wp_json_encode(__('Clean Now', 'wp-optimal-state')); ?> +
-                            '</button>' +
-                            '</div>';
-                });
-                $('#wp-opt-state-cleanup-items').html(html).hide().fadeIn(300);
-            }
-            
-            $(document).on('click', '.wp-opt-state-clean-btn:not(:disabled)', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                var itemType = btn.data('type');
-                var isSafe = btn.data('safe');
-                
-                var confirmMsg = isSafe ? 
-                    <?php echo wp_json_encode(__('Clean this item? This action cannot be undone.', 'wp-optimal-state')); ?> :
-                    <?php echo wp_json_encode(__('This operation should be reviewed carefully. Are you sure you want to continue?', 'wp-optimal-state')); ?>;
-                
-                var title = isSafe ? 
-                    <?php echo wp_json_encode(__('Confirm Cleanup', 'wp-optimal-state')); ?> : 
-                    <?php echo wp_json_encode(__('⚠️ Warning', 'wp-optimal-state')); ?>;
-                
-                showModal(title, confirmMsg, function() {
-                    wpOptStateAjax.isProcessing = true;
-                    btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Cleaning...', 'wp-optimal-state')); ?>);
-                    
-                    $.post(wpOptStateAjax.ajaxurl, {
-                        action: 'wp_opt_state_clean_item',
-                        nonce: wpOptStateAjax.nonce,
-                        item_type: itemType
-                    })
-                    .done(function(response) {
-                        wpOptStateAjax.isProcessing = false;
-                        if (response.success) {
-                            btn.removeClass('loading').addClass('success').text(<?php echo wp_json_encode(__('Cleaned ✓', 'wp-optimal-state')); ?>);
-                            showToast(<?php echo wp_json_encode(__('Successfully cleaned!', 'wp-optimal-state')); ?>, 'success');
-                            setTimeout(function() { loadStats(); }, 1500);
-                        } else {
-                            btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Error - Try Again', 'wp-optimal-state')); ?>);
-                            showToast(response.data || <?php echo wp_json_encode(__('Cleanup failed', 'wp-optimal-state')); ?>, 'error');
-                        }
-                    })
-                    .fail(function() {
-                        wpOptStateAjax.isProcessing = false;
-                        btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Error - Try Again', 'wp-optimal-state')); ?>);
-                        handleAjaxError();
-                    });
-                }, !isSafe);
-            });
-            
-            $('#wp-opt-state-refresh-stats').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                loadStats();
-                showToast(<?php echo wp_json_encode(__('Statistics refreshed', 'wp-optimal-state')); ?>, 'info');
-            });
-            
-            $('#wp-opt-state-optimize-tables').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                wpOptStateAjax.isProcessing = true;
-                btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Optimizing...', 'wp-optimal-state')); ?>);
-                
-                $.post(wpOptStateAjax.ajaxurl, {
-                    action: 'wp_opt_state_optimize_tables',
-                    nonce: wpOptStateAjax.nonce
-                })
-                .done(function(response) {
-                    wpOptStateAjax.isProcessing = false;
-                    if (response.success) {
-                        var message = <?php echo wp_json_encode(__('✓ Successfully optimized', 'wp-optimal-state')); ?> + ' ' + response.data.optimized + ' ' + <?php echo wp_json_encode(__('tables!', 'wp-optimal-state')); ?>;
-                        $('#wp-opt-state-table-results').addClass('show').html(
-                            '<div class="wp-opt-state-success">' + message + '</div>'
-                        ).hide().fadeIn(300);
-                        showToast(message, 'success');
-                    }
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize All Tables', 'wp-optimal-state')); ?>);
-                })
-                .fail(function() {
-                    wpOptStateAjax.isProcessing = false;
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize All Tables', 'wp-optimal-state')); ?>);
-                    handleAjaxError();
-                });
-            });
-            
-            $('#wp-opt-state-analyze-repair-tables').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                wpOptStateAjax.isProcessing = true;
-                btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Analyzing...', 'wp-optimal-state')); ?>);
-                
-                $.post(wpOptStateAjax.ajaxurl, {
-                    action: 'wp_opt_state_analyze_repair_tables',
-                    nonce: wpOptStateAjax.nonce
-                })
-                .done(function(response) {
-                    wpOptStateAjax.isProcessing = false;
-                    if (response.success) {
-                        var message = '';
-                        if (response.data.analyzed > 0) {
-                            message = <?php echo wp_json_encode(__('✓ Analyzed', 'wp-optimal-state')); ?> + ' ' + response.data.analyzed + ' ' + <?php echo wp_json_encode(__('tables', 'wp-optimal-state')); ?>;
-                            if (response.data.repaired > 0) {
-                                message += ', ' + <?php echo wp_json_encode(__('repaired', 'wp-optimal-state')); ?> + ' ' + response.data.repaired + ' ' + <?php echo wp_json_encode(__('tables', 'wp-optimal-state')); ?>;
-                            }
-                            message += '!';
-                        } else {
-                            message = <?php echo wp_json_encode(__('No tables need repair', 'wp-optimal-state')); ?>;
-                        }
-                        
-                        $('#wp-opt-state-table-results').addClass('show').html(
-                            '<div class="wp-opt-state-success">' + message + '</div>'
-                        ).hide().fadeIn(300);
-                        showToast(message, 'success');
-                    }
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Analyze & Repair Tables', 'wp-optimal-state')); ?>);
-                })
-                .fail(function() {
-                    wpOptStateAjax.isProcessing = false;
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Analyze & Repair Tables', 'wp-optimal-state')); ?>);
-                    handleAjaxError();
-                });
-            });
-            
-            $('#wp-opt-state-optimize-autoload').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                wpOptStateAjax.isProcessing = true;
-                btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Optimizing...', 'wp-optimal-state')); ?>);
-                
-                $.post(wpOptStateAjax.ajaxurl, {
-                    action: 'wp_opt_state_optimize_autoload',
-                    nonce: wpOptStateAjax.nonce
-                })
-                .done(function(response) {
-                    wpOptStateAjax.isProcessing = false;
-                    if (response.success) {
-                        var message = <?php echo wp_json_encode(__('✓ Optimized', 'wp-optimal-state')); ?> + ' ' + response.data.optimized + ' ' + 
-                                     <?php echo wp_json_encode(__('large autoloaded options (found', 'wp-optimal-state')); ?> + ' ' + response.data.found + ' ' + 
-                                     <?php echo wp_json_encode(__('total)', 'wp-optimal-state')); ?>;
-                        $('#wp-opt-state-table-results').addClass('show').html(
-                            '<div class="wp-opt-state-success">' + message + '</div>'
-                        ).hide().fadeIn(300);
-                        showToast(message, 'success');
-                        setTimeout(function() { loadStats(); }, 1500);
-                    }
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize Autoloaded Options', 'wp-optimal-state')); ?>);
-                })
-                .fail(function() {
-                    wpOptStateAjax.isProcessing = false;
-                    btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize Autoloaded Options', 'wp-optimal-state')); ?>);
-                    handleAjaxError();
-                });
-            });
-            
-            $('#wp-opt-state-clean-old-revisions').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                var days = $('input[name="<?php echo esc_js($this->option_name); ?>[revision_days]"]').val() || 30;
-                
-                var confirmMessage = <?php echo wp_json_encode(__('Delete all revisions older than', 'wp-optimal-state')); ?> + ' ' + days + ' ' + <?php echo wp_json_encode(__('days? This action cannot be undone.', 'wp-optimal-state')); ?>;
-                
-                showModal(<?php echo wp_json_encode(__('Confirm Deletion', 'wp-optimal-state')); ?>, confirmMessage, function() {
-                    wpOptStateAjax.isProcessing = true;
-                    btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Cleaning...', 'wp-optimal-state')); ?>);
-                    
-                    $.post(wpOptStateAjax.ajaxurl, {
-                        action: 'wp_opt_state_clean_old_revisions',
-                        nonce: wpOptStateAjax.nonce,
-                        days: days
-                    })
-                    .done(function(response) {
-                        wpOptStateAjax.isProcessing = false;
-                        if (response.success) {
-                            var message = <?php echo wp_json_encode(__('✓ Deleted', 'wp-optimal-state')); ?> + ' ' + response.data.deleted + ' ' + <?php echo wp_json_encode(__('old revisions', 'wp-optimal-state')); ?>;
-                            showToast(message, 'success');
-                            loadStats();
-                        }
-                        btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Clean Old Revisions Now', 'wp-optimal-state')); ?>);
-                    })
-                    .fail(function() {
-                        wpOptStateAjax.isProcessing = false;
-                        btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Clean Old Revisions Now', 'wp-optimal-state')); ?>);
-                        handleAjaxError();
-                    });
-                }, false);
-            });
-            
-            $('#wp-opt-state-one-click').on('click', function() {
-                if (wpOptStateAjax.isProcessing) return;
-                
-                var btn = $(this);
-                var message = <?php echo wp_json_encode(__('This will perform a full database optimization including:<br><br>• Clean post revisions<br>• Remove auto-drafts<br>• Delete spam comments<br>• Remove orphaned data<br>• Optimize database tables<br><br>This is safe but cannot be undone.', 'wp-optimal-state')); ?>;
-                
-                showModal(<?php echo wp_json_encode(__('🚀 Full Optimization', 'wp-optimal-state')); ?>, message, function() {
-                    wpOptStateAjax.isProcessing = true;
-                    btn.prop('disabled', true).addClass('loading').text(<?php echo wp_json_encode(__('Optimizing...', 'wp-optimal-state')); ?>);
-                    
-                    $.post(wpOptStateAjax.ajaxurl, {
-                        action: 'wp_opt_state_one_click_optimize',
-                        nonce: wpOptStateAjax.nonce
-                    })
-                    .done(function(response) {
-                        wpOptStateAjax.isProcessing = false;
-                        var html = '<div class="wp-opt-state-success"><strong>' + <?php echo wp_json_encode(__('✓ Optimization Complete!', 'wp-optimal-state')); ?> + '</strong></div>';
-                        
-                        if (response.success) {
-                            for (var key in response.data) {
-                                html += '<div class="wp-opt-state-result-item">' + 
-                                       <?php echo wp_json_encode(__('Cleaned', 'wp-optimal-state')); ?> + ' ' + response.data[key] + ' ' + 
-                                       key.replace(/_/g, ' ') + '</div>';
-                            }
-                            showToast(<?php echo wp_json_encode(__('Optimization completed successfully!', 'wp-optimal-state')); ?>, 'success');
-                        }
-                        
-                        $('#wp-opt-state-one-click-results').addClass('show').html(html).hide().fadeIn(300);
-                        btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize Now', 'wp-optimal-state')); ?>);
-                        setTimeout(function() { loadStats(); }, 1500);
-                    })
-                    .fail(function() {
-                        wpOptStateAjax.isProcessing = false;
-                        btn.removeClass('loading').prop('disabled', false).text(<?php echo wp_json_encode(__('Optimize Now', 'wp-optimal-state')); ?>);
-                        handleAjaxError();
-                    });
-                }, false);
-            });
-            
-            loadStats();
-        });
-        </script>
-        <?php
+        
+        // Localize scripts for the Optimizer
+        wp_localize_script('wp-opt-state-admin-script', 'wpOptStateAjax', array(
+            'ajaxurl' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce($this->nonce_action)
+        ));
+
+        // Localize scripts for the Backup Manager
+        wp_localize_script('wp-opt-state-admin-script', 'dbBackupManager', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('db_backup_nonce')
+        ));
     }
-    
+
     /**
-     * Display the main admin page
+     * Display the main admin page with integrated backup UI
      */
     public function display_admin_page() {
         if (!current_user_can('manage_options')) {
             wp_die(esc_html__('You do not have sufficient permissions to access this page.', 'wp-optimal-state'));
         }
         
+        // Data for the optimizer settings form
         $options = get_option($this->option_name, array());
-        $revision_days = isset($options['revision_days']) ? intval($options['revision_days']) : 30;
+        $auto_optimize_days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+
+        // Data for the backup manager UI
+        $backups = $this->db_backup_manager->get_backups();
         ?>
         <div class="wrap wp-opt-state-wrap">
-            <h1 style="font-size: 1.8em; font-weight: 600;"><span class="dashicons dashicons-performance"></span> <?php echo esc_html($this->plugin_name); ?></h1>
-            <?php settings_errors(); ?>
-            
-            <div class="wp-opt-state-container">
-                <div class="wp-opt-state-notice wp-opt-state-notice-warning">
-                    <strong>⚠️ <?php esc_html_e('Important:', 'wp-optimal-state'); ?></strong> <?php esc_html_e('Always backup your database before performing cleanup operations.', 'wp-optimal-state'); ?> 
-                    <a href="<?php echo esc_url(admin_url('export.php')); ?>" target="_blank"><?php esc_html_e('Export your data here', 'wp-optimal-state'); ?></a>
-                </div>
-
+            <h1 class="wp-opt-state-title"><span class="dashicons dashicons-performance"></span> <?php echo esc_html($this->plugin_name); ?></h1>
+                <div class="db-backup-wrap" style="margin: 0;">
+                    <div class="db-backup-notice" id="backup-notice" style="display:none;"></div>
+					
+				<div class="wp-opt-state-container">
                 <div class="wp-opt-state-notice">
-                    <strong>📖 <?php esc_html_e('Need Help?', 'wp-optimal-state'); ?></strong> <?php esc_html_e('Check out the full plugin manual for detailed instructions and best practices.', 'wp-optimal-state'); ?>
-                    <a href="https://spiritualseek.com/wp-optimal-state-wordpress-plugin/" target="_blank" rel="noopener noreferrer"><?php esc_html_e('Read the Manual', 'wp-optimal-state'); ?></a>
+                    <strong>ℹ️ <?php esc_html_e('Need Help?', 'wp-optimal-state'); ?></strong> <?php esc_html_e('Check out the full plugin manual for detailed instructions and best practices.', 'wp-optimal-state'); ?>
+                    <a href="https://spiritualseek.com/wp-optimal-state-wordpress-plugin/" target="_blank" rel="noopener noreferrer"><?php esc_html_e('Read the Manual 📘', 'wp-optimal-state'); ?></a>
                 </div>
                 
-                <div class="wp-opt-state-grid">
+                    <div class="db-backup-card">
+                        
+                        
+                        
+       <div class="db-backup-card">
+    <h2><span class="dashicons dashicons-database-export" style="font-size: 24px; height: 24px; width: 24px;"></span> <?php esc_html_e('1. Create a Database Backup', 'wp-optimal-state'); ?></h2>
+    <p style="line-height: 1.7em;"><?php echo wp_kses(sprintf(__('💾 Always backup your database before performing cleanup operations. <br>✔ You will be able to restore it if something goes wrong during cleanup.<br>📁 Backups are stored in your <span style="color: #7C092E;">/wp-content/uploads/db-backups</span> folder and can <span style="text-decoration: underline;">consume disk space</span>.', 'wp-optimal-state')), array('strong' => array(), 'br' => array(), 'span' => array('style' => array()))); ?></p>
+    
+    
+    <div style="margin-bottom: 15px;">
+        <label for="max_backups_setting" style="display: block; margin-bottom: 5px; font-weight: 600;">
+            <?php esc_html_e('Maximum Backups to Keep:', 'wp-optimal-state'); ?>
+        </label>
+        <select style="font-weight: bold; width: 100px;" name="max_backups_setting" id="max_backups_setting">
+            <?php
+            $current_max = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
+            for ($i = 1; $i <= 10; $i++) {
+                $selected = ($i === $current_max) ? 'selected' : '';
+                echo '<option value="' . esc_attr($i) . '" ' . $selected . '>' . esc_html($i) . '</option>';
+            }
+            ?>
+        </select>
+        <button type="button" class="button" id="save-max-backups-btn" style="margin-left: 10px;">
+            <?php esc_html_e('✔ Save', 'wp-optimal-state'); ?>
+        </button>
+        <p class="description" style="margin-top: 5px;">
+            <?php esc_html_e('⚠️ Older backups will be automatically deleted when this limit is reached.', 'wp-optimal-state'); ?>
+        </p>
+    </div>
+       <button type="button" class="button button-primary button-large" id="create-backup-btn">
+                            <span class="dashicons dashicons-plus-alt"></span> <?php esc_html_e('Create Backup Now', 'wp-optimal-state'); ?>
+                        </button>
+                        <div class="db-backup-spinner" id="backup-spinner" style="display:none;">
+                            <span class="spinner is-active"></span>
+                            <span><?php esc_html_e('Creating backup...', 'wp-optimal-state'); ?></span>
+                        </div>
+                    </div>
+                    
+                    <div class="db-backup-card">
+                        <h2><span class="dashicons dashicons-database-view" style="font-size: 24px; height: 24px; width: 24px;"></span> <?php esc_html_e('1.1 Manage Existing Backups', 'wp-optimal-state'); ?></h2>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr>
+                                    <th><?php esc_html_e('Backup Name', 'wp-optimal-state'); ?></th>
+                                    <th><?php esc_html_e('Date Created', 'wp-optimal-state'); ?></th>
+                                    <th><?php esc_html_e('Size', 'wp-optimal-state'); ?></th>
+                                    <th><?php esc_html_e('Actions', 'wp-optimal-state'); ?></th>
+                                </tr>
+                            </thead>
+                            <tbody id="backups-list">
+                                <?php if (empty($backups)): ?>
+                                    <tr>
+                                        <td colspan="4" class="db-backup-empty"><?php esc_html_e('No backups found. Create your first backup!', 'wp-optimal-state'); ?></td>
+                                    </tr>
+                                <?php else: ?>
+                                    <?php foreach ($backups as $backup): ?>
+                                        <tr data-file="<?php echo esc_attr($backup['filename']); ?>">
+                                            <td><strong><?php echo esc_html($backup['filename']); ?></strong></td>
+                                            <td><?php echo esc_html($backup['date']); ?></td>
+                                            <td><?php echo esc_html($backup['size']); ?></td>
+                                            <td>
+                                                <a href="<?php echo esc_url($backup['download_url']); ?>" class="button download-backup">
+                                                    <span class="dashicons dashicons-download"></span> <?php esc_html_e('Download', 'wp-optimal-state'); ?>
+                                                </a>
+                                                <button class="button restore-backup" data-file="<?php echo esc_attr($backup['filename']); ?>">
+                                                    <span class="dashicons dashicons-backup"></span> <?php esc_html_e('Restore', 'wp-optimal-state'); ?>
+                                                </button>
+                                                <button class="button delete-backup" data-file="<?php echo esc_attr($backup['filename']); ?>">
+                                                    <span class="dashicons dashicons-trash"></span> <?php esc_html_e('Delete', 'wp-optimal-state'); ?>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="wp-opt-state-grid-2">
                     <div class="wp-opt-state-card wp-opt-state-card-highlight">
-                        <h2>🚀 <?php esc_html_e('One-Click Optimization', 'wp-optimal-state'); ?></h2>
+                        <h2>💥 <?php esc_html_e('2. One-Click Optimization', 'wp-optimal-state'); ?></h2>
                         <p><?php esc_html_e('Perform all safe optimizations with one click', 'wp-optimal-state'); ?></p>
                         <button class="button button-primary button-hero wp-opt-state-one-click" id="wp-opt-state-one-click">
-                            <?php esc_html_e('Optimize Now', 'wp-optimal-state'); ?>
+                            <?php esc_html_e('🚀 Optimize Now', 'wp-optimal-state'); ?>
                         </button>
                         <div id="wp-opt-state-one-click-results" class="wp-opt-state-results"></div>
                     </div>
                     
-                    <div class="wp-opt-state-card">
-                        <h2>📊 <?php esc_html_e('Database Statistics', 'wp-optimal-state'); ?></h2>
-                        <div id="wp-opt-state-stats-loading" class="wp-opt-state-loading"><?php esc_html_e('Loading statistics...', 'wp-optimal-state'); ?></div>
-                        <div id="wp-opt-state-stats" class="wp-opt-state-stats"></div>
-                        <div id="wp-opt-state-db-size" class="wp-opt-state-db-size">
-                            <strong><?php esc_html_e('Total Database Size:', 'wp-optimal-state'); ?></strong> <span id="wp-opt-state-db-size-value"><?php esc_html_e('Calculating...', 'wp-optimal-state'); ?></span>
-                        </div>
-                        <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-refresh-stats"><?php esc_html_e('Refresh Stats', 'wp-optimal-state'); ?></button>
-                    </div>
+<div class="wp-opt-state-card">
+    <h2>📊 <?php esc_html_e('3. Database Statistics', 'wp-optimal-state'); ?></h2>
+    <div id="wp-opt-state-stats-loading" class="wp-opt-state-loading"><?php esc_html_e('Loading statistics...', 'wp-optimal-state'); ?></div>
+    
+    <div id="wp-opt-state-stats-wrapper" class="wp-opt-state-stats-wrapper">
+        <div id="wp-opt-state-stats" class="wp-opt-state-stats"></div>
+    </div>
+    <button class="button wp-opt-state-toggle-stats" id="wp-opt-state-toggle-stats" style="margin-bottom: 15px; width: 100%; display: none;">
+        <?php esc_html_e('Show More Stats ↓', 'wp-optimal-state'); ?>
+    </button>
+    <div id="wp-opt-state-db-size" class="wp-opt-state-db-size">
+        <strong><?php esc_html_e('Total Database Size:', 'wp-optimal-state'); ?></strong> <span id="wp-opt-state-db-size-value"><?php esc_html_e('Calculating...', 'wp-optimal-state'); ?></span>
+    </div>
+    <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-refresh-stats"><?php esc_html_e('⟲ Refresh Stats', 'wp-optimal-state'); ?></button>
+</div>
                 </div>
                 
                 <div class="wp-opt-state-card">
-                    <h2>🧹 <?php esc_html_e('Database Cleanup', 'wp-optimal-state'); ?></h2>
+                    <h2>🧹 <?php esc_html_e('4. Detailed Database Cleanup', 'wp-optimal-state'); ?></h2>
                     <div class="wp-opt-state-cleanup-grid" id="wp-opt-state-cleanup-items"></div>
                 </div>
                 
                 <div class="wp-opt-state-card">
-                    <h2>🗄️ <?php esc_html_e('Database Optimization', 'wp-optimal-state'); ?></h2>
+                    <h2>🗄️ <?php esc_html_e( '5. Advanced Database Optimization', 'wp-optimal-state'); ?></h2>
                     <p><?php esc_html_e('Optimize and repair database tables to improve performance', 'wp-optimal-state'); ?></p>
                     <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
-                        <button class="button button-secondary" id="wp-opt-state-optimize-tables"><?php esc_html_e('Optimize All Tables', 'wp-optimal-state'); ?></button>
-                        <button class="button button-secondary" id="wp-opt-state-analyze-repair-tables"><?php esc_html_e('Analyze & Repair Tables', 'wp-optimal-state'); ?></button>
-                        <button class="button button-secondary" id="wp-opt-state-optimize-autoload"><?php esc_html_e('Optimize Autoloaded Options', 'wp-optimal-state'); ?></button>
+                        <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-optimize-tables"><?php esc_html_e('⚡ Optimize All Tables', 'wp-optimal-state'); ?></button>
+                        <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-analyze-repair-tables"><?php esc_html_e('🛠️ Analyze & Repair Tables', 'wp-optimal-state'); ?></button>
+                        <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-optimize-autoload"><?php esc_html_e('💾 Optimize Autoloaded Options', 'wp-optimal-state'); ?></button>
                     </div>
                     <div id="wp-opt-state-table-results" class="wp-opt-state-results"></div>
+                    <div style="margin-top: 20px; line-height: 1.7em;">
+<strong>⚡ Optimize Tables</strong>: Runs <u>OPTIMIZE TABLE</u> on all database tables to reclaim space and improve query speed.<br>
+<strong>🛠️ Analyze & Repair</strong>: Checks tables for errors/corruption (<u>CHECK TABLE</u>), then runs <u>REPAIR TABLE</u> to fix issues.<br>
+<strong>💾 Autoloaded Options</strong>: Identifies large autoloaded options and sets them to non-autoload to boost site speed.
+</div>
                 </div>
                 
                 <div class="wp-opt-state-card">
-                    <h2>⚙️ <?php esc_html_e('Settings', 'wp-optimal-state'); ?></h2>
+                    <h2><span class="dashicons dashicons-database-export" style="font-size: 24px; height: 24px; width: 19px;"></span>🧹 <?php esc_html_e('6. Automatic Backup and Cleaning', 'wp-optimal-state'); ?></h2>
                     <form method="post" action="options.php">
                         <?php settings_fields('wp_opt_state_settings_group'); ?>
                         <table class="form-table">
                             <tr>
-                                <th><?php esc_html_e('Delete Revisions Older Than', 'wp-optimal-state'); ?></th>
+                                <th><?php esc_html_e('Run Tasks Automatically Every', 'wp-optimal-state'); ?></th>
                                 <td>
-                                    <input type="number" name="<?php echo esc_attr($this->option_name); ?>[revision_days]" value="<?php echo esc_attr($revision_days); ?>" min="0" max="365"> <?php esc_html_e('days', 'wp-optimal-state'); ?>
-                                    <p class="description"><?php esc_html_e('Automatically delete post revisions older than specified days (0 = disabled)', 'wp-optimal-state'); ?></p>
-                                    <button type="button" class="button" id="wp-opt-state-clean-old-revisions"><?php esc_html_e('Clean Old Revisions Now', 'wp-optimal-state'); ?></button>
+                                    <input type="number" style="font-weight: bold;" name="<?php echo esc_attr($this->option_name); ?>[auto_optimize_days]" value="<?php echo esc_attr($auto_optimize_days); ?>" min="0" max="365"> <?php echo __('<strong>DAYS</strong> (0 to disable)', 'wp-optimal-state'); ?>
+                                    <p class="description">
+                                        <?php if ($auto_optimize_days > 0): ?>
+                                            ✅ <?php echo sprintf(esc_html__('Automated optimization is enabled and will run every %d days.', 'wp-optimal-state'), $auto_optimize_days); ?>
+                                        <?php else: ?>
+                                            🔴 <?php esc_html_e('Automated optimization is currently disabled.', 'wp-optimal-state'); ?>
+                                        <?php endif; ?>
+                                        <br>
+                                       <?php echo 'ℹ️ ' . __('When enabled, the plugin will automatically: 1. <u>Backup your database</u>;  2. <u>Perform full optimization</u> on the specified schedule.', 'wp-optimal-state'); ?>
+                                    </p>
                                 </td>
                             </tr>
                         </table>
                         <?php submit_button(); ?>
                     </form>
+                    <div id="wp-opt-state-settings-log"></div>
                 </div>
             </div>
         </div>
@@ -589,167 +314,158 @@ class WP_Optimal_State {
     }
     
     /**
-     * AJAX handler for getting database statistics
+     * Log optimization execution
      */
-    public function ajax_get_stats() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
-        }
-        
-        global $wpdb;
-        
-        $stats = array(
-            'post_revisions' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'revision'")),
-            'auto_drafts' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = 'auto-draft'")),
-            'trashed_posts' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = 'trash'")),
-            'spam_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = 'spam'")),
-            'trashed_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = 'trash'")),
-            'orphaned_postmeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id NOT IN (SELECT ID FROM {$wpdb->posts})")),
-            'orphaned_commentmeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->commentmeta} WHERE comment_id NOT IN (SELECT comment_id FROM {$wpdb->comments})")),
-            'orphaned_relationships' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->term_relationships} WHERE object_id NOT IN (SELECT ID FROM {$wpdb->posts})")),
-            'expired_transients' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_%' AND option_value < UNIX_TIMESTAMP()")),
-            'all_transients' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE '_transient_%'")),
-            'duplicate_postmeta' => absint($this->count_duplicate_postmeta()),
-            'duplicate_commentmeta' => absint($this->count_duplicate_commentmeta()),
-            'orphaned_usermeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE user_id NOT IN (SELECT ID FROM {$wpdb->users})")),
-            'unapproved_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = '0'")),
-            'pingbacks' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_type = 'pingback'")),
-            'trackbacks' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_type = 'trackback'")),
-            'autoload_options' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE autoload = 'yes'")),
-            'autoload_size' => $this->get_autoload_size(),
-        );
-        
-        wp_send_json_success($stats);
+/**
+ * Log optimization execution
+ */
+private function log_optimization($type = 'scheduled') {
+    $log = get_option($this->log_option_name, array());
+    
+    $operation = ($type === 'scheduled') ? 'Full Optimization + Database Backup' : 'Full Optimization';
+    
+    $log_entry = array(
+        'timestamp' => current_time('timestamp'),
+        'type' => $type,
+        'date' => current_time('Y-m-d H:i:s'),
+        'operation' => $operation
+    );
+    
+    // Keep only last 20 entries to prevent log from growing too large
+    array_unshift($log, $log_entry);
+    $log = array_slice($log, 0, 20);
+    
+    update_option($this->log_option_name, $log, false);
+}
+
+    /**
+     * Get optimization log
+     */
+    private function get_optimization_log() {
+        return get_option($this->log_option_name, array());
     }
     
     /**
-     * AJAX handler for cleaning individual items
+     * Set optimization limits for memory and time
+     */
+    private function set_optimization_limits() {
+        @set_time_limit(300); // 5 minutes
+        @ini_set('memory_limit', '256M');
+    }
+    
+    /**
+     * AJAX handler for getting database statistics
+     */
+public function ajax_get_stats() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+        return;
+    }
+    
+    // Check if we should bypass cache
+    $force_refresh = isset($_POST['force_refresh']) && $_POST['force_refresh'] == 'true';
+    
+    // Check if we have cached stats (unless forcing refresh)
+    if (!$force_refresh) {
+        $cached_stats = get_transient('wp_opt_state_stats_cache');
+        if ($cached_stats !== false) {
+            wp_send_json_success($cached_stats);
+            return;
+        }
+    }
+
+    global $wpdb;
+    
+    // Initialize default metrics
+    $db_metrics = (object) [
+        'total_overhead' => 0,
+        'total_indexes_size' => 0,
+        'total_tables_count' => 0
+    ];
+
+    // Fetch overall DB technical metrics
+    $query_result = $wpdb->get_row($wpdb->prepare("
+        SELECT 
+            SUM(data_free) as total_overhead,
+            SUM(index_length) as total_indexes_size,
+            COUNT(*) as total_tables_count,
+            MIN(create_time) as db_creation_date
+        FROM information_schema.TABLES
+        WHERE table_schema = %s
+    ", DB_NAME));
+
+    if (!is_wp_error($query_result) && !is_null($query_result)) {
+        $db_metrics = $query_result;
+    }
+
+    // Get autoloaded options data
+    $autoload_data = $wpdb->get_row("
+        SELECT 
+            COUNT(*) as autoload_count,
+            SUM(LENGTH(option_value)) as autoload_size
+        FROM {$wpdb->options} 
+        WHERE autoload = 'yes'
+    ");
+
+    // Prepare stats array
+    $stats = array(
+        'post_revisions' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'revision'")),
+        'auto_drafts' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = 'auto-draft'")),
+        'trashed_posts' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status = 'trash'")),
+        'spam_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = 'spam'")),
+        'trashed_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = 'trash'")),
+        'orphaned_postmeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id NOT IN (SELECT ID FROM {$wpdb->posts})")),
+        'orphaned_commentmeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->commentmeta} WHERE comment_id NOT IN (SELECT comment_id FROM {$wpdb->comments})")),
+        'orphaned_relationships' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->term_relationships} WHERE object_id NOT IN (SELECT ID FROM {$wpdb->posts})")),
+        'expired_transients' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_%' AND option_value < UNIX_TIMESTAMP()")),
+        'all_transients' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE '_transient_%'")),
+        'duplicate_postmeta' => absint($this->count_duplicate_postmeta()),
+        'duplicate_commentmeta' => absint($this->count_duplicate_commentmeta()),
+        'orphaned_usermeta' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->usermeta} WHERE user_id NOT IN (SELECT ID FROM {$wpdb->users})")),
+        'unapproved_comments' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_approved = '0'")),
+        'pingbacks' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_type = 'pingback'")),
+        'trackbacks' => absint($wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_type = 'trackback'")),
+        'table_overhead' => is_numeric($db_metrics->total_overhead) ? size_format($db_metrics->total_overhead, 2) : '0 B',
+        'total_indexes_size' => is_numeric($db_metrics->total_indexes_size) ? size_format($db_metrics->total_indexes_size, 2) : '0 B',
+        'autoload_options' => absint($autoload_data->autoload_count),
+        'autoload_size' => is_numeric($autoload_data->autoload_size) ? size_format($autoload_data->autoload_size, 2) : '0 B',
+        'total_tables_count' => absint($db_metrics->total_tables_count),
+        'db_creation_date' => get_option('wp_opt_state_activation_time') ?  date('Y-m-d', get_option('wp_opt_state_activation_time')) : (get_option('wp_install') ? date('Y-m-d H:i', strtotime(get_option('wp_install'))) : 
+        'Unknown')
+    );
+    
+    // Cache stats for 15 minutes
+    set_transient('wp_opt_state_stats_cache', $stats, 15 * MINUTE_IN_SECONDS);
+    
+    wp_send_json_success($stats);
+}
+    
+    /**
+     * AJAX handler for cleaning specific items
      */
     public function ajax_clean_item() {
         check_ajax_referer($this->nonce_action, 'nonce');
         
         if (!current_user_can('manage_options')) {
             wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
         }
         
-        $item_type = isset($_POST['item_type']) ? sanitize_text_field(wp_unslash($_POST['item_type'])) : '';
+        $this->set_optimization_limits();
         
-        if (empty($item_type)) {
-            wp_send_json_error(__('Invalid item type', 'wp-optimal-state'));
-            return;
-        }
+        $item_type = sanitize_key($_POST['item_type']);
         
-        $result = $this->clean_item($item_type);
+        $method = 'clean_' . $item_type;
         
-        if ($result !== false) {
-            wp_send_json_success(array('deleted' => $result));
+        if (method_exists($this, $method)) {
+            $cleaned = $this->$method();
+            // Clear stats cache after cleanup
+            delete_transient('wp_opt_state_stats_cache');
+            wp_send_json_success($cleaned);
         } else {
-            wp_send_json_error(__('Cleanup failed', 'wp-optimal-state'));
+            wp_send_json_error(__('Invalid cleanup type', 'wp-optimal-state'));
         }
-    }
-    
-    /**
-     * Clean specific item type from database
-     */
-    private function clean_item($item_type) {
-        global $wpdb;
-        
-        $allowed_types = array(
-            'post_revisions', 'auto_drafts', 'trashed_posts', 'spam_comments',
-            'trashed_comments', 'orphaned_postmeta', 'orphaned_commentmeta',
-            'orphaned_relationships', 'expired_transients', 'all_transients',
-            'duplicate_postmeta', 'duplicate_commentmeta', 'orphaned_usermeta',
-            'unapproved_comments', 'pingbacks', 'trackbacks'
-        );
-        
-        if (!in_array($item_type, $allowed_types, true)) {
-            return false;
-        }
-        
-        switch ($item_type) {
-            case 'post_revisions':
-                return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_type = 'revision'");
-                
-            case 'auto_drafts':
-                return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_status = 'auto-draft'");
-                
-            case 'trashed_posts':
-                return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_status = 'trash'");
-                
-            case 'spam_comments':
-                return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = 'spam'");
-                
-            case 'trashed_comments':
-                return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = 'trash'");
-                
-            case 'orphaned_postmeta':
-                return $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE post_id NOT IN (SELECT ID FROM {$wpdb->posts})");
-                
-            case 'orphaned_commentmeta':
-                return $wpdb->query("DELETE FROM {$wpdb->commentmeta} WHERE comment_id NOT IN (SELECT comment_id FROM {$wpdb->comments})");
-                
-            case 'orphaned_relationships':
-                return $wpdb->query("DELETE FROM {$wpdb->term_relationships} WHERE object_id NOT IN (SELECT ID FROM {$wpdb->posts})");
-                
-            case 'expired_transients':
-                return $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_%' AND option_value < UNIX_TIMESTAMP()");
-                
-            case 'all_transients':
-                return $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_%'");
-                
-            case 'duplicate_postmeta':
-                return $this->delete_duplicate_postmeta();
-                
-            case 'duplicate_commentmeta':
-                return $this->delete_duplicate_commentmeta();
-                
-            case 'orphaned_usermeta':
-                return $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE user_id NOT IN (SELECT ID FROM {$wpdb->users})");
-                
-            case 'unapproved_comments':
-                return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = '0'");
-                
-            case 'pingbacks':
-                return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_type = 'pingback'");
-                
-            case 'trackbacks':
-                return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_type = 'trackback'");
-                
-            default:
-                return false;
-        }
-    }
-    
-    /**
-     * AJAX handler for optimizing database tables
-     */
-    public function ajax_optimize_tables() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
-        }
-        
-        global $wpdb;
-        $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
-        $optimized = 0;
-        
-        if (is_array($tables)) {
-            foreach ($tables as $table) {
-                if (isset($table[0])) {
-                    $table_name = esc_sql($table[0]);
-                    $wpdb->query("OPTIMIZE TABLE `{$table_name}`");
-                    $optimized++;
-                }
-            }
-        }
-        
-        wp_send_json_success(array('optimized' => $optimized));
     }
     
     /**
@@ -760,324 +476,1130 @@ class WP_Optimal_State {
         
         if (!current_user_can('manage_options')) {
             wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
         }
         
-        $safe_items = array(
-            'post_revisions', 'auto_drafts', 'spam_comments', 'trashed_comments',
-            'orphaned_postmeta', 'orphaned_commentmeta', 'orphaned_relationships',
-            'expired_transients', 'orphaned_usermeta', 'pingbacks', 'trackbacks'
-        );
+        $this->set_optimization_limits();
         
-        $results = array();
-        foreach ($safe_items as $item) {
-            $deleted = $this->clean_item($item);
-            if ($deleted !== false && $deleted > 0) {
-                $results[$item] = $deleted;
-            }
-        }
+        $cleaned = $this->perform_optimizations(true); // true for AJAX mode to return data
+        $this->log_optimization('manual');
         
-        global $wpdb;
-        $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
-        if (is_array($tables)) {
-            foreach ($tables as $table) {
-                if (isset($table[0])) {
-                    $table_name = esc_sql($table[0]);
-                    $wpdb->query("OPTIMIZE TABLE `{$table_name}`");
-                }
-            }
-        }
+        // Clear stats cache after optimization
+        delete_transient('wp_opt_state_stats_cache');
         
-        wp_send_json_success($results);
+        wp_send_json_success($cleaned);
     }
     
     /**
-     * AJAX handler for getting database size
+     * AJAX handler for getting optimization log
      */
-    public function ajax_get_db_size() {
+    public function ajax_get_optimization_log() {
         check_ajax_referer($this->nonce_action, 'nonce');
         
         if (!current_user_can('manage_options')) {
             wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
         }
         
-        global $wpdb;
-        $size = $wpdb->get_var($wpdb->prepare("
-            SELECT SUM(data_length + index_length) 
-            FROM information_schema.TABLES 
-            WHERE table_schema = %s
-        ", DB_NAME));
-        
-        wp_send_json_success(array('size' => $this->format_bytes($size)));
+        $log = $this->get_optimization_log();
+        wp_send_json_success($log);
     }
     
     /**
-     * AJAX handler for cleaning old revisions
+ * AJAX handler for saving max backups setting
+ */
+public function ajax_save_max_backups() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('message' => __('Unauthorized access', 'wp-optimal-state')));
+    }
+    
+    $max_backups = isset($_POST['max_backups']) ? intval($_POST['max_backups']) : 5;
+    $max_backups = min(max($max_backups, 1), 10);
+    
+    $options = get_option($this->option_name, array());
+    $options['max_backups'] = $max_backups;
+    
+    update_option($this->option_name, $options);
+    
+    wp_send_json_success(array('message' => __('Setting saved successfully', 'wp-optimal-state')));
+}
+    
+    /**
+     * Perform optimizations (used for both AJAX and scheduled; returns data if $return_data true)
      */
-    public function ajax_clean_old_revisions() {
+    private function perform_optimizations($return_data = false) {
+        $cleaned = array();
+        
+        $cleaned['post_revisions'] = $this->clean_post_revisions();
+        $cleaned['auto_drafts'] = $this->clean_auto_drafts();
+        $cleaned['trashed_posts'] = $this->clean_trashed_posts();
+        $cleaned['spam_comments'] = $this->clean_spam_comments();
+        $cleaned['trashed_comments'] = $this->clean_trashed_comments();
+        $cleaned['orphaned_postmeta'] = $this->clean_orphaned_postmeta();
+        $cleaned['orphaned_commentmeta'] = $this->clean_orphaned_commentmeta();
+        $cleaned['orphaned_relationships'] = $this->clean_orphaned_relationships();
+        $cleaned['expired_transients'] = $this->clean_expired_transients();
+        $cleaned['duplicate_postmeta'] = $this->clean_duplicate_postmeta();
+        $cleaned['duplicate_commentmeta'] = $this->clean_duplicate_commentmeta();
+        $cleaned['orphaned_usermeta'] = $this->clean_orphaned_usermeta();
+        $cleaned['pingbacks'] = $this->clean_pingbacks();
+        $cleaned['trackbacks'] = $this->clean_trackbacks();
+        
+        $this->perform_optimize_tables(false); // Silent optimize
+        
+        if ($return_data) {
+            return $cleaned;
+        }
+    }
+    
+    /**
+     * AJAX handler for optimizing tables
+     */
+    public function ajax_optimize_tables() {
         check_ajax_referer($this->nonce_action, 'nonce');
         
         if (!current_user_can('manage_options')) {
             wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
         }
         
-        $days = isset($_POST['days']) ? absint($_POST['days']) : 30;
-        $days = min(max($days, 0), 365);
+        $this->set_optimization_limits();
         
-        global $wpdb;
-        $deleted = $wpdb->query($wpdb->prepare("
-            DELETE FROM {$wpdb->posts} 
-            WHERE post_type = 'revision' 
-            AND post_modified < DATE_SUB(NOW(), INTERVAL %d DAY)
-        ", $days));
+        $result = $this->perform_optimize_tables(true); // true for AJAX mode
         
-        wp_send_json_success(array('deleted' => absint($deleted)));
+        // Clear stats cache after optimization
+        delete_transient('wp_opt_state_stats_cache');
+        
+        wp_send_json_success($result);
     }
     
     /**
-     * AJAX handler for optimizing autoload options
+     * Optimize tables (returns data if $return_data true)
      */
-    public function ajax_optimize_autoload() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
-        }
-        
+    private function perform_optimize_tables($return_data = false) {
         global $wpdb;
         
-        $large_options = $wpdb->get_results("
-            SELECT option_name, LENGTH(option_value) as size 
-            FROM {$wpdb->options} 
-            WHERE autoload = 'yes' 
-            AND LENGTH(option_value) > 102400
-            ORDER BY size DESC
-            LIMIT 10
-        ");
-        
+        $tables = $wpdb->get_results("SHOW TABLES", ARRAY_N);
         $optimized = 0;
-        $excluded = array('active_plugins', 'cron', 'rewrite_rules');
         
-        if (is_array($large_options)) {
-            foreach ($large_options as $option) {
-                if (!in_array($option->option_name, $excluded, true)) {
-                    $wpdb->update(
-                        $wpdb->options,
-                        array('autoload' => 'no'),
-                        array('option_name' => $option->option_name),
-                        array('%s'),
-                        array('%s')
-                    );
-                    $optimized++;
-                }
-            }
+        foreach ($tables as $table) {
+            $table_name = $table[0];
+            // SECURITY FIX: Properly escape table names
+            $escaped_table_name = $wpdb->_escape($table_name);
+            $result = $wpdb->query("OPTIMIZE TABLE `$escaped_table_name`");
+            if ($result) $optimized++;
         }
         
-        wp_send_json_success(array(
-            'optimized' => $optimized,
-            'found' => is_array($large_options) ? count($large_options) : 0
-        ));
+        if ($return_data) {
+            return array('optimized' => $optimized);
+        }
     }
     
     /**
-     * AJAX handler for analyzing and repairing database tables
+     * AJAX handler for analyze and repair tables
      */
     public function ajax_analyze_repair_tables() {
         check_ajax_referer($this->nonce_action, 'nonce');
         
         if (!current_user_can('manage_options')) {
             wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-            return;
         }
+        
+        $this->set_optimization_limits();
         
         global $wpdb;
         
-        // Get all database tables
-        $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
+        $tables = $wpdb->get_results("SHOW TABLES", ARRAY_N);
         $analyzed = 0;
         $repaired = 0;
-        $results = array();
         
-        if (is_array($tables)) {
-            foreach ($tables as $table) {
-                if (isset($table[0])) {
-                    $table_name = $table[0];
-                    $analyzed++;
-                    
-                    // Analyze the table
-                    $analysis = $wpdb->get_row($wpdb->prepare("CHECK TABLE `%s`", $table_name));
-                    
-                    if ($analysis && isset($analysis->Msg_text)) {
-                        $message = $analysis->Msg_text;
-                        
-                        // Check if table needs repair
-                        if (in_array(strtoupper($message), array('OK', 'TABLE IS ALREADY UP TO DATE'))) {
-                            // Table is fine
-                            $results[$table_name] = __('OK', 'wp-optimal-state');
-                        } else {
-                            // Table needs repair - attempt to repair it
-                            $repair_result = $wpdb->get_row($wpdb->prepare("REPAIR TABLE `%s`", $table_name));
-                            
-                            if ($repair_result && isset($repair_result->Msg_text)) {
-                                $repair_message = $repair_result->Msg_text;
-                                
-                                if (in_array(strtoupper($repair_message), array('OK', 'TABLE IS ALREADY UP TO DATE'))) {
-                                    $results[$table_name] = __('Repaired', 'wp-optimal-state');
-                                    $repaired++;
-                                } else {
-                                    $results[$table_name] = sprintf(__('Repair failed: %s', 'wp-optimal-state'), $repair_message);
-                                }
-                            } else {
-                                $results[$table_name] = __('Repair analysis failed', 'wp-optimal-state');
-                            }
-                        }
-                    } else {
-                        $results[$table_name] = __('Analysis failed', 'wp-optimal-state');
-                    }
-                    
-                    // Add small delay to prevent server overload
-                    if (count($tables) > 10) {
-                        usleep(100000); // 0.1 second delay for large databases
-                    }
-                }
+        foreach ($tables as $table) {
+            $table_name = $table[0];
+            // SECURITY FIX: Properly escape table names
+            $escaped_table_name = $wpdb->_escape($table_name);
+            
+            $check = $wpdb->get_row("CHECK TABLE `$escaped_table_name`");
+            $analyzed++;
+            
+            if (strtolower($check->Msg_text) !== 'ok') {
+                $repair = $wpdb->query("REPAIR TABLE `$escaped_table_name`");
+                if ($repair) $repaired++;
             }
         }
         
-        // Log results for debugging
-        if (defined('WP_DEBUG') && WP_DEBUG === true) {
-            error_log('WP Optimal State - Table analysis completed: ' . $analyzed . ' analyzed, ' . $repaired . ' repaired');
-        }
+        // Clear stats cache after repair
+        delete_transient('wp_opt_state_stats_cache');
         
         wp_send_json_success(array(
             'analyzed' => $analyzed,
-            'repaired' => $repaired,
-            'results' => $results
+            'repaired' => $repaired
         ));
     }
     
     /**
-     * Run scheduled cleanup tasks
+     * AJAX handler for optimizing autoload
      */
-    public function run_scheduled_cleanup() {
-        $safe_items = array(
-            'expired_transients', 'orphaned_postmeta',
-            'orphaned_commentmeta', 'spam_comments'
-        );
+    public function ajax_optimize_autoload() {
+        check_ajax_referer($this->nonce_action, 'nonce');
         
-        foreach ($safe_items as $item) {
-            $this->clean_item($item);
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
         }
         
         global $wpdb;
-        $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
-        if (is_array($tables)) {
+        
+        $threshold = 1024 * 10; // 10KB
+        
+        $large_options = $wpdb->get_results($wpdb->prepare(
+            "SELECT option_name FROM {$wpdb->options} 
+             WHERE autoload = 'yes' AND LENGTH(option_value) > %d",
+            $threshold
+        ));
+        
+        $optimized = 0;
+        
+        foreach ($large_options as $option) {
+            $wpdb->update(
+                $wpdb->options,
+                array('autoload' => 'no'),
+                array('option_name' => $option->option_name)
+            );
+            $optimized++;
+        }
+        
+        // Clear stats cache after optimization
+        delete_transient('wp_opt_state_stats_cache');
+        
+        wp_send_json_success(array(
+            'optimized' => $optimized,
+            'found' => count($large_options)
+        ));
+    }
+    
+    /**
+     * AJAX handler for getting DB size
+     */
+    public function ajax_get_db_size() {
+        check_ajax_referer($this->nonce_action, 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+        }
+        
+        global $wpdb;
+        
+        $size = $wpdb->get_var($wpdb->prepare(
+            "SELECT SUM(data_length + index_length) 
+             FROM information_schema.TABLES 
+             WHERE table_schema = %s",
+            DB_NAME
+        ));
+        
+        wp_send_json_success(array('size' => size_format($size, 2)));
+    }
+    
+    /**
+     * Handle settings update to reschedule cron
+     */
+    public function handle_settings_update($old_value, $new_value, $option) {
+        wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
+        
+        $days = isset($new_value['auto_optimize_days']) ? intval($new_value['auto_optimize_days']) : 0;
+        
+        if ($days > 0) {
+            $interval = $days * DAY_IN_SECONDS;
+            $recurrence = ($days == 1) ? 'daily' : (($days == 7) ? 'weekly' : "every_{$days}_days");
+            wp_schedule_event(time() + $interval, $recurrence, 'wp_opt_state_scheduled_cleanup');
+        }
+        
+        // Clear stats cache when settings change
+        delete_transient('wp_opt_state_stats_cache');
+    }
+    
+    /**
+     * Add custom cron intervals
+     */
+    public function add_custom_cron_interval($schedules) {
+        $options = get_option($this->option_name);
+        $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+        
+        if ($days > 1 && $days != 7) {
+            $schedules["every_{$days}_days"] = array(
+                'interval' => $days * DAY_IN_SECONDS,
+                'display' => sprintf(__('Every %d Days', 'wp-optimal-state'), $days)
+            );
+        }
+        
+        return $schedules;
+    }
+    
+    /**
+     * Run scheduled cleanup (backup + optimize)
+     */
+    public function run_scheduled_cleanup() {
+        $this->set_optimization_limits();
+        $this->db_backup_manager->create_backup_silent();
+        $this->perform_optimizations();
+        $this->log_optimization('scheduled');
+        
+        // Clear stats cache after scheduled cleanup
+        delete_transient('wp_opt_state_stats_cache');
+    }
+    
+    // --- Cleanup Methods (unchanged) ---
+    
+    private function clean_post_revisions() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_type = 'revision'");
+    }
+    
+    private function clean_auto_drafts() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_status = 'auto-draft'");
+    }
+    
+    private function clean_trashed_posts() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->posts} WHERE post_status = 'trash'");
+    }
+    
+    private function clean_spam_comments() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = 'spam'");
+    }
+    
+    private function clean_trashed_comments() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = 'trash'");
+    }
+    
+    private function clean_orphaned_postmeta() {
+        global $wpdb;
+        return $wpdb->query("DELETE pm FROM {$wpdb->postmeta} pm LEFT JOIN {$wpdb->posts} p ON pm.post_id = p.ID WHERE p.ID IS NULL");
+    }
+    
+    private function clean_orphaned_commentmeta() {
+        global $wpdb;
+        return $wpdb->query("DELETE cm FROM {$wpdb->commentmeta} cm LEFT JOIN {$wpdb->comments} c ON cm.comment_id = c.comment_ID WHERE c.comment_ID IS NULL");
+    }
+    
+    private function clean_orphaned_relationships() {
+        global $wpdb;
+        return $wpdb->query("DELETE tr FROM {$wpdb->term_relationships} tr LEFT JOIN {$wpdb->posts} p ON tr.object_id = p.ID WHERE p.ID IS NULL");
+    }
+    
+    private function clean_expired_transients() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_%' AND option_value < UNIX_TIMESTAMP()");
+    }
+    
+    private function clean_all_transients() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_%'");
+    }
+    
+    private function clean_duplicate_postmeta() {
+        global $wpdb;
+        $duplicates = $wpdb->get_results("SELECT meta_key, post_id, COUNT(*) as count FROM {$wpdb->postmeta} GROUP BY meta_key, post_id, meta_value HAVING count > 1");
+        $cleaned = 0;
+        
+        foreach ($duplicates as $dup) {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s AND post_id = %d LIMIT %d",
+                $dup->meta_key, $dup->post_id, $dup->count - 1
+            ));
+            $cleaned += $dup->count - 1;
+        }
+        
+        return $cleaned;
+    }
+    
+    private function clean_duplicate_commentmeta() {
+        global $wpdb;
+        $duplicates = $wpdb->get_results("SELECT meta_key, comment_id, COUNT(*) as count FROM {$wpdb->commentmeta} GROUP BY meta_key, comment_id, meta_value HAVING count > 1");
+        $cleaned = 0;
+        
+        foreach ($duplicates as $dup) {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->commentmeta} WHERE meta_key = %s AND comment_id = %d LIMIT %d",
+                $dup->meta_key, $dup->comment_id, $dup->count - 1
+            ));
+            $cleaned += $dup->count - 1;
+        }
+        
+        return $cleaned;
+    }
+    
+    private function clean_orphaned_usermeta() {
+        global $wpdb;
+        return $wpdb->query("DELETE um FROM {$wpdb->usermeta} um LEFT JOIN {$wpdb->users} u ON um.user_id = u.ID WHERE u.ID IS NULL");
+    }
+    
+    private function clean_unapproved_comments() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_approved = '0'");
+    }
+    
+    private function clean_pingbacks() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_type = 'pingback'");
+    }
+    
+    private function clean_trackbacks() {
+        global $wpdb;
+        return $wpdb->query("DELETE FROM {$wpdb->comments} WHERE comment_type = 'trackback'");
+    }
+    
+    private function count_duplicate_postmeta() {
+        global $wpdb;
+        return $wpdb->get_var("SELECT COUNT(*) FROM (SELECT COUNT(*) as count FROM {$wpdb->postmeta} GROUP BY meta_key, post_id, meta_value HAVING count > 1) as dup");
+    }
+    
+    private function count_duplicate_commentmeta() {
+        global $wpdb;
+        return $wpdb->get_var("SELECT COUNT(*) FROM (SELECT COUNT(*) as count FROM {$wpdb->commentmeta} GROUP BY meta_key, comment_id, meta_value HAVING count > 1) as dup");
+    }
+}
+
+/**
+ * Database Backup Manager Class
+ */
+class DB_Backup_Manager {
+    
+    private $backup_dir;
+    private $max_backups;
+    
+public function __construct() {
+    $this->backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
+    
+    // Get max backups from settings, default to 3
+    $options = get_option('wp_opt_state_settings', array());
+    $this->max_backups = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
+    
+        add_action('wp_ajax_create_backup', array($this, 'ajax_create_backup'));
+        add_action('wp_ajax_delete_backup', array($this, 'ajax_delete_backup'));
+        add_action('wp_ajax_restore_backup', array($this, 'ajax_restore_backup'));
+        add_action('init', array($this, 'handle_download_backup'));
+        add_action('init', array($this, 'protect_backup_directory'));
+    }
+    
+    /**
+     * Protect backup directory with .htaccess
+     */
+    public function protect_backup_directory() {
+        if (!is_dir($this->backup_dir)) {
+            return;
+        }
+        
+        $htaccess_file = $this->backup_dir . '.htaccess';
+        if (!file_exists($htaccess_file)) {
+            @file_put_contents($htaccess_file, "Order deny,allow\nDeny from all\n<Files ~ \"\\.sql$\">\nAllow from all\n</Files>");
+        }
+        
+        // Add index.php to prevent directory listing
+        $index_file = $this->backup_dir . 'index.php';
+        if (!file_exists($index_file)) {
+            @file_put_contents($index_file, "<?php\n// Silence is golden");
+        }
+    }
+    
+/**
+ * Check rate limiting for backup operations
+ */
+private function check_rate_limit($action) {
+    $transient_name = 'wp_opt_state_rate_limit_' . $action;
+    $last_called = get_transient($transient_name);
+    if ($last_called !== false) {
+        if (time() - $last_called < 30) {
+            return false;
+        }
+    }
+    
+    set_transient($transient_name, time(), 30);
+    return true;
+}
+    
+    /**
+     * Set backup operation limits
+     */
+    private function set_backup_limits() {
+        @set_time_limit(600); // 10 minutes
+        @ini_set('memory_limit', '512M');
+    }
+    
+    public function get_backups() {
+        $backups = glob($this->backup_dir . '*.sql');
+        $backup_list = array();
+        
+        foreach ($backups as $file) {
+            $filename = basename($file);
+            $download_url = add_query_arg(array(
+                'action' => 'db_backup_download',
+                'file' => $filename,
+                '_wpnonce' => wp_create_nonce('db_backup_download_nonce')
+            ), admin_url());
+            
+            $backup_list[] = array(
+                'filename' => $filename,
+                'date' => date('Y-m-d H:i:s', filemtime($file)),
+                'size' => size_format(filesize($file), 2),
+                'filepath' => $file,
+                'download_url' => $download_url
+            );
+        }
+        
+        usort($backup_list, function($a, $b) {
+            return strtotime($b['date']) - strtotime($a['date']);
+        });
+        
+        return $backup_list;
+    }
+    
+    public function ajax_create_backup() {
+        check_ajax_referer('db_backup_nonce', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Insufficient permissions.'));
+        }
+        
+        // Check rate limiting
+if (!$this->check_rate_limit('create_backup')) {
+    wp_send_json_error(array('message' => 'Please wait 30 seconds before performing a new backup.'));
+    return;
+}
+        
+        $this->set_backup_limits();
+        
+        if (!is_dir($this->backup_dir)) {
+            if (!@mkdir($this->backup_dir, 0755, true)) {
+                wp_send_json_error(array('message' => 'Failed to create backup directory. Please check permissions.'));
+            }
+        }
+        
+        $filename = 'db-backup-' . date('Y-m-d-H-i-s') . '.sql';
+        $filepath = $this->backup_dir . $filename;
+        
+        global $wpdb;
+        
+        $handle = @fopen($filepath, 'w');
+        if (!$handle) {
+            wp_send_json_error(array('message' => 'Failed to create backup file. Please check directory permissions.'));
+        }
+        
+        try {
+            // Write SQL header (phpMyAdmin style)
+            fwrite($handle, "-- WordPress Database Backup\n");
+            fwrite($handle, "-- Created: " . date('Y-m-d H:i:s') . "\n");
+            fwrite($handle, "-- Database: " . DB_NAME . "\n");
+            fwrite($handle, "-- PHP Version: " . PHP_VERSION . "\n");
+            fwrite($handle, "-- WordPress Version: " . get_bloginfo('version') . "\n");
+            fwrite($handle, "-- ------------------------------------------------------\n\n");
+            
+            fwrite($handle, "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;\n");
+            fwrite($handle, "/*!40101 SET NAMES utf8mb4 */;\n");
+            fwrite($handle, "/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;\n");
+            fwrite($handle, "/*!40103 SET TIME_ZONE='+00:00' */;\n");
+            fwrite($handle, "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;\n");
+            fwrite($handle, "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n");
+            fwrite($handle, "/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\n\n");
+            
+            // Get all tables
+            $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
+            
+            if (empty($tables)) {
+                fclose($handle);
+                @unlink($filepath);
+                wp_send_json_error(array('message' => 'No database tables found.'));
+            }
+            
+            // Disable foreign key checks during backup creation
+            fwrite($handle, "SET FOREIGN_KEY_CHECKS = 0;\n\n");
+            
             foreach ($tables as $table) {
-                if (isset($table[0])) {
-                    $table_name = esc_sql($table[0]);
-                    $wpdb->query("OPTIMIZE TABLE `{$table_name}`");
+                $table_name = $table[0];
+                
+                fwrite($handle, "-- ------------------------------------------------------\n");
+                fwrite($handle, "-- Table structure for `{$table_name}`\n");
+                fwrite($handle, "-- ------------------------------------------------------\n\n");
+                
+                // Drop table if exists
+                fwrite($handle, "DROP TABLE IF EXISTS `{$table_name}`;\n");
+                
+                // Get table creation SQL
+                $create_table = $wpdb->get_row("SHOW CREATE TABLE `{$table_name}`", ARRAY_N);
+                if ($create_table && isset($create_table[1])) {
+                    fwrite($handle, $create_table[1] . ";\n\n");
+                } else {
+                    throw new Exception("Failed to get structure for table: {$table_name}");
+                }
+                
+                // Get table data using optimized batch processing
+                $this->backup_table_data($handle, $table_name);
+                
+                fwrite($handle, "-- ------------------------------------------------------\n\n");
+            }
+            
+            // Re-enable foreign key checks
+            fwrite($handle, "SET FOREIGN_KEY_CHECKS = 1;\n\n");
+            
+            // Write SQL footer
+            fwrite($handle, "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;\n");
+            fwrite($handle, "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n");
+            fwrite($handle, "/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;\n");
+            fwrite($handle, "/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;\n");
+            fwrite($handle, "/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;\n");
+            fwrite($handle, "/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n");
+            fwrite($handle, "/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n");
+            fwrite($handle, "/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;\n");
+            
+            fclose($handle);
+            
+            // Verify backup file
+            if (!file_exists($filepath) || filesize($filepath) < 100) {
+                @unlink($filepath);
+                wp_send_json_error(array('message' => 'Backup file is invalid or empty.'));
+            }
+            
+            $this->enforce_backup_limit();
+            
+            $backups = $this->get_backups();
+            
+            wp_send_json_success(array(
+                'message' => 'Backup created successfully!',
+                'backups' => $backups
+            ));
+            
+        } catch (Exception $e) {
+            if ($handle) {
+                fclose($handle);
+            }
+            @unlink($filepath);
+            wp_send_json_error(array('message' => 'Backup failed: ' . $e->getMessage()));
+        }
+    }
+    
+    /**
+     * Backup table data with memory-efficient batch processing
+     */
+    private function backup_table_data($handle, $table_name) {
+        global $wpdb;
+        
+        $row_count = $wpdb->get_var("SELECT COUNT(*) FROM `{$table_name}`");
+        
+        if ($row_count > 0) {
+            fwrite($handle, "--\n");
+            fwrite($handle, "-- Dumping data for table `{$table_name}`\n");
+            fwrite($handle, "--\n\n");
+            
+            // Use smaller batch size for memory efficiency
+            $batch_size = 50;
+            $offset = 0;
+            
+            // Get column information
+            $columns = $wpdb->get_results("SHOW COLUMNS FROM `{$table_name}`", ARRAY_A);
+            $column_names = array();
+            foreach ($columns as $column) {
+                $column_names[] = $column['Field'];
+            }
+            
+            while ($offset < $row_count) {
+                $rows = $wpdb->get_results(
+                    $wpdb->prepare("SELECT * FROM `{$table_name}` LIMIT %d OFFSET %d", $batch_size, $offset),
+                    ARRAY_A
+                );
+                
+                if (!empty($rows)) {
+                    foreach ($rows as $row) {
+                        $values = array();
+                        
+                        foreach ($column_names as $column_name) {
+                            if (!isset($row[$column_name])) {
+                                $values[] = 'NULL';
+                            } else {
+                                $value = $row[$column_name];
+                                
+                                // Handle different data types properly
+                                if (is_null($value)) {
+                                    $values[] = 'NULL';
+                                } elseif (is_numeric($value) && !is_string($value)) {
+                                    $values[] = $value;
+                                } else {
+                                    // Proper SQL escaping (phpMyAdmin style)
+                                    $escaped_value = str_replace(
+                                        array('\\', "\0", "\n", "\r", "'", '"', "\x1a"),
+                                        array('\\\\', '\\0', '\\n', '\\r', "\\'", '\\"', '\\Z'),
+                                        $value
+                                    );
+                                    $values[] = "'" . $escaped_value . "'";
+                                }
+                            }
+                        }
+                        
+                        fwrite($handle, "INSERT INTO `{$table_name}` (`" . implode('`, `', $column_names) . "`) VALUES (" . implode(', ', $values) . ");\n");
+                    }
+                }
+                
+                // Free memory
+                unset($rows);
+                
+                $offset += $batch_size;
+            }
+            
+            fwrite($handle, "\n");
+        }
+    }
+    
+    /**
+     * Silent backup creation for scheduled tasks
+     */
+    public function create_backup_silent() {
+        if (!is_dir($this->backup_dir)) {
+            if (!@mkdir($this->backup_dir, 0755, true)) {
+                return false;
+            }
+        }
+        
+        $filename = 'db-backup-' . date('Y-m-d-H-i-s') . '.sql';
+        $filepath = $this->backup_dir . $filename;
+        
+        global $wpdb;
+        
+        $handle = @fopen($filepath, 'w');
+        if (!$handle) {
+            return false;
+        }
+        
+        try {
+            // Write SQL header (phpMyAdmin style)
+            fwrite($handle, "-- WordPress Database Backup\n");
+            fwrite($handle, "-- Created: " . date('Y-m-d H:i:s') . "\n");
+            fwrite($handle, "-- Database: " . DB_NAME . "\n");
+            fwrite($handle, "-- PHP Version: " . PHP_VERSION . "\n");
+            fwrite($handle, "-- WordPress Version: " . get_bloginfo('version') . "\n");
+            fwrite($handle, "-- ------------------------------------------------------\n\n");
+            
+            fwrite($handle, "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;\n");
+            fwrite($handle, "/*!40101 SET NAMES utf8mb4 */;\n");
+            fwrite($handle, "/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;\n");
+            fwrite($handle, "/*!40103 SET TIME_ZONE='+00:00' */;\n");
+            fwrite($handle, "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;\n");
+            fwrite($handle, "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n");
+            fwrite($handle, "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n");
+            fwrite($handle, "/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;\n\n");
+            
+            // Get all tables
+            $tables = $wpdb->get_results('SHOW TABLES', ARRAY_N);
+            
+            if (empty($tables)) {
+                fclose($handle);
+                @unlink($filepath);
+                return false;
+            }
+            
+            // Disable foreign key checks during backup creation
+            fwrite($handle, "SET FOREIGN_KEY_CHECKS = 0;\n\n");
+            
+            foreach ($tables as $table) {
+                $table_name = $table[0];
+                
+                fwrite($handle, "-- ------------------------------------------------------\n");
+                fwrite($handle, "-- Table structure for `{$table_name}`\n");
+                fwrite($handle, "-- ------------------------------------------------------\n\n");
+                
+                // Drop table if exists
+                fwrite($handle, "DROP TABLE IF EXISTS `{$table_name}`;\n");
+                
+                // Get table creation SQL
+                $create_table = $wpdb->get_row("SHOW CREATE TABLE `{$table_name}`", ARRAY_N);
+                if ($create_table && isset($create_table[1])) {
+                    fwrite($handle, $create_table[1] . ";\n\n");
+                } else {
+                    throw new Exception("Failed to get structure for table: {$table_name}");
+                }
+                
+                // Get table data using optimized batch processing
+                $this->backup_table_data($handle, $table_name);
+                
+                fwrite($handle, "-- ------------------------------------------------------\n\n");
+            }
+            
+            // Re-enable foreign key checks
+            fwrite($handle, "SET FOREIGN_KEY_CHECKS = 1;\n\n");
+            
+            // Write SQL footer
+            fwrite($handle, "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;\n");
+            fwrite($handle, "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n");
+            fwrite($handle, "/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;\n");
+            fwrite($handle, "/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;\n");
+            fwrite($handle, "/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;\n");
+            fwrite($handle, "/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;\n");
+            fwrite($handle, "/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;\n");
+            fwrite($handle, "/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;\n");
+            
+            fclose($handle);
+            
+            // Verify backup file
+            if (!file_exists($filepath) || filesize($filepath) < 100) {
+                @unlink($filepath);
+                return false;
+            }
+            
+            $this->enforce_backup_limit();
+            
+            return true;
+            
+        } catch (Exception $e) {
+            if ($handle) {
+                fclose($handle);
+            }
+            @unlink($filepath);
+            return false;
+        }
+    }
+    
+    private function enforce_backup_limit() {
+        $backups = $this->get_backups();
+        
+        if (count($backups) > $this->max_backups) {
+            $to_delete = array_slice($backups, $this->max_backups);
+            
+            foreach ($to_delete as $backup) {
+                if (file_exists($backup['filepath'])) {
+                    unlink($backup['filepath']);
                 }
             }
         }
     }
     
-    /**
-     * Count duplicate postmeta entries
-     */
-    private function count_duplicate_postmeta() {
-        global $wpdb;
-        $query = "SELECT COUNT(*) FROM (
-            SELECT post_id, meta_key, COUNT(*) as cnt 
-            FROM {$wpdb->postmeta} 
-            GROUP BY post_id, meta_key 
-            HAVING cnt > 1
-        ) as duplicates";
-        return absint($wpdb->get_var($query));
+    public function ajax_delete_backup() {
+        check_ajax_referer('db_backup_nonce', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Insufficient permissions.'));
+        }
+        
+        $filename = sanitize_file_name($_POST['filename']);
+        
+        // SECURITY FIX: Prevent directory traversal
+        if (strpos($filename, '..') !== false || strpos($filename, '/') !== false || strpos($filename, '\\') !== false) {
+            wp_send_json_error(array('message' => 'Invalid filename.'));
+        }
+        
+        $filepath = $this->backup_dir . $filename;
+        
+        // SECURITY FIX: Ensure the file is within the backup directory
+        $real_filepath = realpath($filepath);
+        $real_backup_dir = realpath($this->backup_dir);
+        
+        if ($real_filepath === false || strpos($real_filepath, $real_backup_dir) !== 0) {
+            wp_send_json_error(array('message' => 'Invalid file path.'));
+        }
+        
+        if (!file_exists($filepath)) {
+            wp_send_json_error(array('message' => 'Backup file not found.'));
+        }
+        
+        if (unlink($filepath)) {
+            wp_send_json_success(array('message' => 'Backup deleted successfully!'));
+        } else {
+            wp_send_json_error(array('message' => 'Failed to delete backup.'));
+        }
     }
     
-    /**
-     * Delete duplicate postmeta entries
-     */
-    private function delete_duplicate_postmeta() {
-        global $wpdb;
-        return absint($wpdb->query("
-            DELETE pm1 FROM {$wpdb->postmeta} pm1
-            INNER JOIN {$wpdb->postmeta} pm2 
-            WHERE pm1.meta_id < pm2.meta_id 
-            AND pm1.post_id = pm2.post_id 
-            AND pm1.meta_key = pm2.meta_key
-        "));
+public function ajax_restore_backup() {
+    check_ajax_referer('db_backup_nonce', 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('message' => 'Insufficient permissions.'));
     }
     
-    /**
-     * Count duplicate commentmeta entries
-     */
-    private function count_duplicate_commentmeta() {
-        global $wpdb;
-        $query = "SELECT COUNT(*) FROM (
-            SELECT comment_id, meta_key, COUNT(*) as cnt 
-            FROM {$wpdb->commentmeta} 
-            GROUP BY comment_id, meta_key 
-            HAVING cnt > 1
-        ) as duplicates";
-        return absint($wpdb->get_var($query));
+    // Check rate limiting
+if (!$this->check_rate_limit('restore_backup')) {
+    wp_send_json_error(array('message' => 'Please wait 30 seconds before restoring another backup.'));
+    return;
+}
+    
+    $this->set_backup_limits();
+    
+    $filename = sanitize_file_name($_POST['filename']);
+    
+    if (strpos($filename, '..') !== false || strpos($filename, '/') !== false || strpos($filename, '\\') !== false) {
+        wp_send_json_error(array('message' => 'Invalid filename.'));
     }
     
-    /**
-     * Delete duplicate commentmeta entries
-     */
-    private function delete_duplicate_commentmeta() {
-        global $wpdb;
-        return absint($wpdb->query("
-            DELETE cm1 FROM {$wpdb->commentmeta} cm1
-            INNER JOIN {$wpdb->commentmeta} cm2 
-            WHERE cm1.meta_id < cm2.meta_id 
-            AND cm1.comment_id = cm2.comment_id 
-            AND cm1.meta_key = cm2.meta_key
-        "));
+    $filepath = $this->backup_dir . $filename;
+    
+    $real_filepath = realpath($filepath);
+    $real_backup_dir = realpath($this->backup_dir);
+    
+    if ($real_filepath === false || strpos($real_filepath, $real_backup_dir) !== 0) {
+        wp_send_json_error(array('message' => 'Invalid file path.'));
     }
     
-    /**
-     * Get total size of autoloaded options
-     */
-    private function get_autoload_size() {
-        global $wpdb;
-        $size = $wpdb->get_var("
-            SELECT SUM(LENGTH(option_value)) 
-            FROM {$wpdb->options} 
-            WHERE autoload = 'yes'
-        ");
-        return $this->format_bytes($size);
+    if (!file_exists($filepath)) {
+        wp_send_json_error(array('message' => 'Backup file not found.'));
     }
     
-    /**
-     * Format bytes to human readable format
-     */
-    private function format_bytes($bytes, $precision = 2) {
-        $units = array('B', 'KB', 'MB', 'GB', 'TB');
-        $bytes = max($bytes, 0);
-        $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
-        $pow = min($pow, count($units) - 1);
-        $bytes /= pow(1024, $pow);
-        return round($bytes, $precision) . ' ' . $units[$pow];
+    global $wpdb;
+
+    // --- START: MODIFIED CODE ---
+
+    try {
+        // Open the backup file for reading instead of loading it all into memory
+        $handle = @fopen($filepath, 'r');
+        if (!$handle) {
+            wp_send_json_error(array('message' => 'Failed to open backup file for reading.'));
+        }
+
+        // Disable foreign key checks and start a transaction
+        $wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+        $wpdb->query('SET AUTOCOMMIT = 0');
+        $wpdb->query('START TRANSACTION');
+        
+        $query_buffer = ''; // This will hold the current query as we build it from lines
+        $executed_queries = 0;
+        $errors = array();
+
+        // Read the file line-by-line
+        while (($line = fgets($handle)) !== false) {
+            $line = trim($line);
+
+            // Skip empty lines and SQL comments
+            if (empty($line) || strpos($line, '--') === 0 || strpos($line, '/*') === 0 || strpos($line, '#') === 0) {
+                continue;
+            }
+             
+            // Append the current line to the buffer
+            $query_buffer .= $line;
+
+            // If the line ends with a semicolon, we have a complete query
+            if (substr($line, -1) === ';') {
+                $result = $wpdb->query($query_buffer);
+
+                if ($result === false) {
+                    $error_msg = $wpdb->last_error;
+                    if (!(preg_match('/^DROP TABLE/i', $query_buffer) && strpos($error_msg, "doesn't exist") !== false)) {
+                         $errors[] = array(
+                            'query' => substr($query_buffer, 0, 150) . '...',
+                            'error' => $error_msg
+                        );
+                    }
+                } else {
+                    $executed_queries++;
+                }
+
+                // Reset the buffer for the next query
+                $query_buffer = '';
+            }
+        }
+        
+        fclose($handle); // Close the file handle
+
+        // --- END: MODIFIED CODE ---
+        
+        // Commit changes and re-enable checks
+        $wpdb->query('COMMIT');
+        $wpdb->query('SET AUTOCOMMIT = 1');
+        $wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+        
+        if (!empty($errors)) {
+            wp_send_json_error(array(
+                'message' => 'Database restore completed with some errors.',
+                'executed' => $executed_queries,
+                'total_errors' => count($errors),
+                'first_error' => $errors[0]['error']
+            ));
+        }
+        
+        if ($executed_queries === 0) {
+            wp_send_json_error(array('message' => 'No queries were executed. The backup file might be empty or corrupted.'));
+        }
+        
+        delete_transient('wp_opt_state_stats_cache');
+        
+        wp_send_json_success(array(
+            'message' => 'Database restored successfully! ' . $executed_queries . ' queries executed.',
+            'executed' => $executed_queries
+        ));
+        
+    } catch (Exception $e) {
+        $wpdb->query('ROLLBACK');
+        $wpdb->query('SET AUTOCOMMIT = 1');
+        $wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+        
+        wp_send_json_error(array('message' => 'Restore failed: ' . $e->getMessage()));
     }
 }
 
+/**
+ * Split SQL queries properly while handling semicolons within strings
+ */
+private function split_sql_queries($sql) {
+    $queries = array();
+    $current_query = '';
+    $in_string = false;
+    $string_char = '';
+    $escaped = false;
+    $in_comment = false;
+    $comment_type = ''; // --, #, or /*
+    
+    for ($i = 0; $i < strlen($sql); $i++) {
+        $char = $sql[$i];
+        $next_char = isset($sql[$i + 1]) ? $sql[$i + 1] : '';
+        
+        // Handle comments
+        if (!$in_string && !$escaped) {
+            // Start of single-line comment
+            if (!$in_comment && (($char == '-' && $next_char == '-') || $char == '#')) {
+                $in_comment = true;
+                $comment_type = ($char == '#') ? '#' : '--';
+                $i += ($comment_type == '--') ? 1 : 0;
+                continue;
+            }
+            // Start of multi-line comment
+            elseif (!$in_comment && $char == '/' && $next_char == '*') {
+                $in_comment = true;
+                $comment_type = '/*';
+                $i += 1;
+                continue;
+            }
+            // End of multi-line comment
+            elseif ($in_comment && $comment_type == '/*' && $char == '*' && $next_char == '/') {
+                $in_comment = false;
+                $comment_type = '';
+                $i += 1;
+                continue;
+            }
+            // End of single-line comment
+            elseif ($in_comment && ($comment_type == '--' || $comment_type == '#') && ($char == "\n" || $char == "\r")) {
+                $in_comment = false;
+                $comment_type = '';
+            }
+        }
+        
+        // If we're in a comment, skip this character
+        if ($in_comment) {
+            continue;
+        }
+        
+        // Handle string escaping
+        if (!$escaped && $char == "\\") {
+            $escaped = true;
+            $current_query .= $char;
+            continue;
+        }
+        
+        // Handle string boundaries
+        if (!$escaped && ($char == "'" || $char == '"')) {
+            if (!$in_string) {
+                $in_string = true;
+                $string_char = $char;
+            } elseif ($in_string && $char == $string_char) {
+                $in_string = false;
+                $string_char = '';
+            }
+        }
+        
+        // Reset escape flag
+        if ($escaped) {
+            $escaped = false;
+        }
+        
+        // Handle query termination
+        if (!$in_string && $char == ';') {
+            $current_query = trim($current_query);
+            if (!empty($current_query)) {
+                $queries[] = $current_query;
+            }
+            $current_query = '';
+            continue;
+        }
+        
+        $current_query .= $char;
+    }
+    
+    // Add the last query if any
+    $current_query = trim($current_query);
+    if (!empty($current_query)) {
+        $queries[] = $current_query;
+    }
+    
+    return $queries;
+}
+    
+    public function handle_download_backup() {
+        if (isset($_GET['action']) && $_GET['action'] === 'db_backup_download' && isset($_GET['file'])) {
+            
+            if (!isset($_GET['_wpnonce']) || !wp_verify_nonce(sanitize_text_field($_GET['_wpnonce']), 'db_backup_download_nonce')) {
+                wp_die('Security check failed.');
+            }
+
+            if (!current_user_can('manage_options')) {
+                wp_die('You do not have sufficient permissions to download this file.');
+            }
+            
+            $filename = sanitize_file_name($_GET['file']);
+            
+            // SECURITY FIX: Prevent directory traversal
+            if (strpos($filename, '..') !== false || strpos($filename, '/') !== false || strpos($filename, '\\') !== false) {
+                wp_die('Invalid filename.');
+            }
+            
+            $filepath = $this->backup_dir . $filename;
+            
+            // SECURITY FIX: Ensure the file is within the backup directory
+            $real_filepath = realpath($filepath);
+            $real_backup_dir = realpath($this->backup_dir);
+            
+            if ($real_filepath === false || strpos($real_filepath, $real_backup_dir) !== 0) {
+                wp_die('Invalid file path.');
+            }
+            
+            if (file_exists($filepath)) {
+                // SECURITY FIX: Add security headers
+                header('Content-Description: File Transfer');
+                header('Content-Type: application/sql');
+                header('Content-Disposition: attachment; filename="' . basename($filepath) . '"');
+                header('Expires: 0');
+                header('Cache-Control: must-revalidate');
+                header('Pragma: public');
+                header('Content-Length: ' . filesize($filepath));
+                header('X-Content-Type-Options: nosniff');
+                header('X-Frame-Options: DENY');
+                header('X-XSS-Protection: 1; mode=block');
+                flush();
+                readfile($filepath);
+                exit;
+            } else {
+                wp_die('File not found.');
+            }
+        }
+    }
+}
+
+
+// --- Global Functions and Hooks ---
+
+// Initialize the main plugin class
 new WP_Optimal_State();
 
+// Activation and deactivation hooks
 register_activation_hook(__FILE__, 'wp_opt_state_activate');
 function wp_opt_state_activate() {
     $default_settings = array(
         'schedule' => 'disabled',
         'keep_revisions' => 5,
-        'revision_days' => 30,
+        'auto_optimize_days' => 0,
         'optimize_images' => 0
     );
     add_option('wp_opt_state_settings', $default_settings);
     add_option('wp_opt_state_backup_reminder', 1);
     add_option('wp_opt_state_activation_time', time());
+    add_option('wp_opt_state_optimization_log', array());
 }
 
 register_deactivation_hook(__FILE__, 'wp_opt_state_deactivate');
@@ -1085,6 +1607,7 @@ function wp_opt_state_deactivate() {
     wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
 }
 
+// Settings registration
 add_action('admin_init', 'wp_opt_state_register_settings');
 function wp_opt_state_register_settings() {
     register_setting(
@@ -1092,7 +1615,7 @@ function wp_opt_state_register_settings() {
         'wp_opt_state_settings',
         array(
             'sanitize_callback' => 'wp_opt_state_sanitize_settings',
-            'default' => array('revision_days' => 30)
+            'default' => array('auto_optimize_days' => 0)
         )
     );
 }
@@ -1100,14 +1623,19 @@ function wp_opt_state_register_settings() {
 function wp_opt_state_sanitize_settings($input) {
     $sanitized = array();
     
-    if (isset($input['revision_days'])) {
-        $sanitized['revision_days'] = absint($input['revision_days']);
-        $sanitized['revision_days'] = min(max($sanitized['revision_days'], 0), 365);
+    if (isset($input['auto_optimize_days'])) {
+        $sanitized['auto_optimize_days'] = absint($input['auto_optimize_days']);
+        $sanitized['auto_optimize_days'] = min(max($sanitized['auto_optimize_days'], 0), 365);
     }
     
     if (isset($input['schedule'])) {
         $allowed_schedules = array('disabled', 'daily', 'weekly');
         $sanitized['schedule'] = in_array($input['schedule'], $allowed_schedules, true) ? $input['schedule'] : 'disabled';
+    }
+    
+    if (isset($input['max_backups'])) {
+        $sanitized['max_backups'] = absint($input['max_backups']);
+        $sanitized['max_backups'] = min(max($sanitized['max_backups'], 1), 10);
     }
     
     return $sanitized;
