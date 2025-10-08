@@ -1,19 +1,19 @@
 jQuery(document).ready(function($) {
     'use strict';
     
-    // --- Reusable Notice Function ---
-    function showNotice(message, type) {
-        const notice = $('#backup-notice');
-        notice.removeClass('notice-success notice-error notice-warning');
-        notice.addClass('notice notice-' + type);
-        notice.html('<p>' + message + '</p>');
-        notice.fadeIn();
-        
-        setTimeout(function() {
-            notice.fadeOut();
-        }, 5000);
-    }
-
+    // Add this utility function to format bytes to human-readable sizes
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+    
     // --- Reusable Confirmation Modal ---
     function showConfirmationModal(title, message, onConfirm) {
         // Remove any existing modals
@@ -100,17 +100,17 @@ jQuery(document).ready(function($) {
                 },
                 success: function(response) {
                     if (response.success) {
-                        showNotice(response.data.message, 'success');
+                        showToast(response.data.message, 'success');
                         updateBackupsList(response.data.backups);
                     } else {
-                        showNotice(response.data.message, 'error');
+                        showToast(response.data.message, 'error');
                     }
                 },
                 error: function(xhr, status, error) {
                     if (xhr.status === 429) {
-                        showNotice('Please wait before creating another backup.', 'error');
+                        showToast('Please wait before creating another backup.', 'error');
                     } else {
-                        showNotice('An error occurred while creating the backup.', 'error');
+                        showToast('An error occurred while creating the backup.', 'error');
                     }
                 },
                 complete: function() {
@@ -142,7 +142,7 @@ jQuery(document).ready(function($) {
                 },
                 success: function(response) {
                     if (response.success) {
-                        showNotice(response.data.message, 'success');
+                        showToast(response.data.message, 'success');
                         row.fadeOut(300, function() {
                             $(this).remove();
                             if ($('#backups-list tr').length === 0) {
@@ -151,12 +151,12 @@ jQuery(document).ready(function($) {
                             }
                         });
                     } else {
-                        showNotice(response.data.message, 'error');
+                        showToast(response.data.message, 'error');
                         btn.prop('disabled', false);
                     }
                 },
                 error: function(xhr, status, error) {
-                    showNotice('An error occurred while deleting the backup.', 'error');
+                    showToast('An error occurred while deleting the backup.', 'error');
                     btn.prop('disabled', false);
                 }
             });
@@ -184,22 +184,22 @@ jQuery(document).ready(function($) {
                 },
                 success: function(response) {
                     if (response.success) {
-                        showNotice(response.data.message + ' Page will reload in 5 seconds...', 'success');
+                        showToast(response.data.message + ' Page will reload in 5 seconds...', 'success');
                         
                         setTimeout(function() {
                             location.reload();
-                        }, 5000);
+                        }, 6000);
                     } else {
-                        showNotice(response.data.message, 'error');
+                        showToast(response.data.message, 'error');
                         btn.prop('disabled', false);
                         btn.html('<span class="dashicons dashicons-backup"></span> Restore');
                     }
                 },
                 error: function(xhr, status, error) {
                     if (xhr.status === 429) {
-                        showNotice('Please wait before restoring another backup.', 'error');
+                        showToast('Please wait before restoring another backup.', 'error');
                     } else {
-                        showNotice('An error occurred during the restore process.', 'error');
+                        showToast('An error occurred during the restore process.', 'error');
                     }
                     btn.prop('disabled', false);
                     btn.html('<span class="dashicons dashicons-backup"></span> Restore');
@@ -225,13 +225,13 @@ jQuery(document).ready(function($) {
             },
             success: function(response) {
                 if (response.success) {
-                    showNotice('Maximum backups setting saved successfully!', 'success');
+                    showToast('Maximum backups setting saved successfully!', 'success');
                 } else {
-                    showNotice(response.data.message || 'Failed to save setting.', 'error');
+                    showToast(response.data.message || 'Failed to save setting.', 'error');
                 }
             },
             error: function() {
-                showNotice('An error occurred while saving the setting.', 'error');
+                showToast('An error occurred while saving the setting.', 'error');
             },
             complete: function() {
                 btn.prop('disabled', false).text('✔ Save');
@@ -316,7 +316,7 @@ jQuery(document).ready(function($) {
         setTimeout(() => {
             $toast.removeClass('show');
             setTimeout(() => { $toast.remove(); }, 300);
-        }, 4000);
+        }, 8000);
     }
     
     function handleAjaxError(xhr, status, error) {
@@ -390,6 +390,58 @@ $('#wp-opt-state-refresh-stats').on('click', function() {
 });
     // END UPDATED loadStats FUNCTION
     
+    // admin.js
+
+// --- Event Handler: Save Automatic Optimization Setting ---
+$('#save-auto-optimize-btn').on('click', function() {
+    const btn = $(this);
+    const autoOptimizeDays = $('#auto_optimize_days').val();
+    
+    // Simple validation
+    if (isNaN(autoOptimizeDays) || autoOptimizeDays < 0 || autoOptimizeDays > 365) {
+        showToast('Please enter a number between 0 and 365.', 'error');
+        return;
+    }
+
+    btn.prop('disabled', true).text('✔ Saving...');
+    
+    $.ajax({
+        url: wpOptStateAjax.ajaxurl, // Use the localized ajaxurl
+        type: 'POST',
+        data: {
+            action: 'wp_opt_state_save_auto_settings', // The new AJAX action
+            nonce: wpOptStateAjax.nonce,
+            auto_optimize_days: autoOptimizeDays
+        },
+        success: function(response) {
+            if (response.success) {
+                showToast(response.data.message, 'success');
+                const days = response.data.days;
+                const enabledSpan = $('#auto-status-enabled');
+                const disabledSpan = $('#auto-status-disabled');
+
+                // Update status message dynamically
+                if (days > 0) {
+                    enabledSpan.html(`✅ Automated optimization is enabled and will run every ${days} days.`);
+                    enabledSpan.show();
+                    disabledSpan.hide();
+                } else {
+                    disabledSpan.show();
+                    enabledSpan.hide();
+                }
+            } else {
+                showToast(response.data.message || 'Failed to save setting.', 'error');
+            }
+        },
+        error: function() {
+            showToast('An error occurred while saving the setting.', 'error');
+        },
+        complete: function() {
+            btn.prop('disabled', false).text('✓ Save Settings');
+        }
+    });
+});
+    
 function displayStats(stats) {
     let html = '';
     for (const key in stats) {
@@ -437,7 +489,7 @@ function displayOptimizationLog(log) {
         log.forEach(entry => {
             const typeClass = entry.type === 'manual' ? 'manual' : 'scheduled';
             const typeLabel = entry.type === 'manual' ? 'Manual' : 'Scheduled';
-            const operation = entry.operation || 'Full Optimization';
+            const operation = entry.operation || 'One-Click Optimization';
             html += `<div class="wp-opt-state-log-item">
                     <span class="wp-opt-state-log-date">${entry.date}</span>
                     <span class="wp-opt-state-log-operation">${operation}</span>
@@ -532,7 +584,7 @@ function displayOptimizationLog(log) {
                 if (response.success) {
                     btn.removeClass('loading').addClass('success').text('Cleaned ✓');
                     showToast('Successfully cleaned!', 'success');
-                    setTimeout(loadStats, 1500);
+                    setTimeout(loadStats, 3000);
                 } else {
                     btn.removeClass('loading').prop('disabled', false).text('Error - Try Again');
                     showToast(response.data || 'Cleanup failed', 'error');
@@ -556,115 +608,242 @@ function displayOptimizationLog(log) {
         showToast('Statistics refreshed', 'info');
     });
     
-    $('#wp-opt-state-optimize-tables').on('click', function() {
-        if (isProcessing) return;
-        
-        const btn = $(this);
-        isProcessing = true;
-        btn.prop('disabled', true).addClass('loading').text('Optimizing...');
-        
-        $.post(wpOptStateAjax.ajaxurl, {
-            action: 'wp_opt_state_optimize_tables',
-            nonce: wpOptStateAjax.nonce
-        })
-        .done(function(response) {
-            isProcessing = false;
-            if (response.success) {
-                const message = `✓ Successfully optimized ${response.data.optimized} tables!`;
-                $('#wp-opt-state-table-results').addClass('show').html(`<div class="wp-opt-state-success">${message}</div>`).hide().fadeIn(300);
-                showToast(message, 'success');
-            }
-            btn.removeClass('loading').prop('disabled', false).text('⚡Optimize All Tables');
-        })
-        .fail(function(xhr) {
-            isProcessing = false;
-            if (xhr.status === 429) {
-                showToast('Please wait before optimizing again.', 'error');
-            } else {
-                showToast('Optimization failed', 'error');
-            }
-            btn.removeClass('loading').prop('disabled', false).text('⚡Optimize All Tables');
-        });
-    });
+// Replace the existing table optimization handler
+$('#wp-opt-state-optimize-tables').on('click', function() {
+    if (isProcessing) return;
     
-    $('#wp-opt-state-analyze-repair-tables').on('click', function() {
-        if (isProcessing) return;
-        
-        const btn = $(this);
-        isProcessing = true;
-        btn.prop('disabled', true).addClass('loading').text('Analyzing...');
-        
-        $.post(wpOptStateAjax.ajaxurl, {
-            action: 'wp_opt_state_analyze_repair_tables',
-            nonce: wpOptStateAjax.nonce
-        })
-        .done(function(response) {
-            isProcessing = false;
-            if (response.success) {
-
-                let message = '';
-                const analyzedCount = response.data.analyzed;
-                const repairedCount = response.data.repaired;
+    const btn = $(this);
+    isProcessing = true;
+    btn.prop('disabled', true).addClass('loading').text('Optimizing...');
+    
+    $.post(wpOptStateAjax.ajaxurl, {
+        action: 'wp_opt_state_optimize_tables',
+        nonce: wpOptStateAjax.nonce
+    })
+    .done(function(response) {
+        isProcessing = false;
+        if (response.success) {
+            const data = response.data;
+            let message = `✓ Successfully optimized ${data.optimized} tables!`;
             
-                if (analyzedCount > 0) {
-                    if (repairedCount > 0) {
-                        message = `✓ Analysis complete. Successfully repaired ${repairedCount} table(s).`;
-                    } else {
-                        message = '✓ Analysis complete. All tables are in optimal condition; no repairs were needed.';
-                    }
-                } else {
-                    message = 'No tables were found to analyze.';
-                }
+            if (data.reclaimed > 0) {
+            const reclaimedFormatted = formatBytes(data.reclaimed);
+            message += ` Reclaimed ${reclaimedFormatted} of space.`;
+            }
+            
+            if (data.skipped > 0) {
+                message += ` ${data.skipped} tables skipped (no optimization needed).`;
+            }
+            
+            if (data.failed > 0) {
+                message += ` ${data.failed} tables failed to optimize.`;
+            }
+            
+            // Show detailed results
+            let detailsHtml = `<div class="wp-opt-state-success">${message}</div>`;
+            
+            if (data.details && data.details.length > 0) {
+                detailsHtml += `<div class="wp-opt-state-details" style="margin-top: 10px; max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; background: #f9f9f9;">`;
+                detailsHtml += `<strong>Detailed Results:</strong><ul style="margin: 5px 0; font-size: 12px;">`;
+                
+                data.details.forEach(detail => {
+                    let statusIcon = '⏭️';
+                    if (detail.status === 'optimized') statusIcon = '✅';
+                    else if (detail.status === 'failed') statusIcon = '❌';
+                    else if (detail.status === 'error') statusIcon = '⚠️';
+                    
+                    detailsHtml += `<li>${statusIcon} ${detail.table}: ${detail.status}`;
+                    if (detail.reclaimed) detailsHtml += ` (reclaimed ${detail.reclaimed})`;
+                    if (detail.error) detailsHtml += ` - ${detail.error}`;
+                    detailsHtml += `</li>`;
+                });
+                
+                detailsHtml += `</ul></div>`;
+            }
+            
+            $('#wp-opt-state-table-results').addClass('show').html(detailsHtml).hide().fadeIn(300);
+            showToast(message, data.failed > 0 ? 'warning' : 'success');
+            
+            // Refresh stats to show updated overhead
+            setTimeout(loadStats, 1500);
+        }
+        btn.removeClass('loading').prop('disabled', false).text('⚡ Optimize All Tables');
+    })
+    .fail(function(xhr) {
+        isProcessing = false;
+        if (xhr.status === 429) {
+            showToast('Please wait before optimizing again.', 'error');
+        } else {
+            showToast('Optimization failed', 'error');
+        }
+        btn.removeClass('loading').prop('disabled', false).text('⚡ Optimize All Tables');
+    });
+});
 
-                $('#wp-opt-state-table-results').addClass('show').html(`<div class="wp-opt-state-success">${message}</div>`).hide().fadeIn(300);
-                showToast(message, 'success');
-            }
-            btn.removeClass('loading').prop('disabled', false).text('🛠️ Analyze & Repair Tables');
-        })
-        .fail(function(xhr) {
-            isProcessing = false;
-            if (xhr.status === 429) {
-                showToast('Please wait before analyzing again.', 'error');
-            } else {
-                showToast('Analysis failed', 'error');
-            }
-            btn.removeClass('loading').prop('disabled', false).text('🛠️ Analyze & Repair Tables');
-        });
-    });
+// Replace the existing analyze & repair handler
+$('#wp-opt-state-analyze-repair-tables').on('click', function() {
+    if (isProcessing) return;
     
-    $('#wp-opt-state-optimize-autoload').on('click', function() {
-        if (isProcessing) return;
-        
-        const btn = $(this);
-        isProcessing = true;
-        btn.prop('disabled', true).addClass('loading').text('Optimizing...');
-        
-        $.post(wpOptStateAjax.ajaxurl, {
-            action: 'wp_opt_state_optimize_autoload',
-            nonce: wpOptStateAjax.nonce
-        })
-        .done(function(response) {
-            isProcessing = false;
-            if (response.success) {
-                const message = `✓ Optimized ${response.data.optimized} large autoloaded options (found ${response.data.found} total)`;
-                $('#wp-opt-state-table-results').addClass('show').html(`<div class="wp-opt-state-success">${message}</div>`).hide().fadeIn(300);
-                showToast(message, 'success');
-                setTimeout(loadStats, 1500);
-            }
-            btn.removeClass('loading').prop('disabled', false).text('💾 Optimize Autoloaded Options');
-        })
-        .fail(function(xhr) {
-            isProcessing = false;
-            if (xhr.status === 429) {
-                showToast('Please wait before optimizing again.', 'error');
-            } else {
-                showToast('Optimization failed', 'error');
-            }
-            btn.removeClass('loading').prop('disabled', false).text('💾 Optimize Autoloaded Options');
-        });
-    });
+    const btn = $(this);
+    isProcessing = true;
+    btn.prop('disabled', true).addClass('loading').text('Analyzing...');
     
-    $('#wp-opt-state-one-click').on('click', function() {
+    $.post(wpOptStateAjax.ajaxurl, {
+        action: 'wp_opt_state_analyze_repair_tables',
+        nonce: wpOptStateAjax.nonce
+    })
+    .done(function(response) {
+        isProcessing = false;
+        if (response.success) {
+            const data = response.data;
+            let message = '';
+            
+            if (data.analyzed > 0) {
+                message = `✓ Analyzed ${data.analyzed} tables. `;
+                
+                if (data.corrupted > 0) {
+                    message += `Found ${data.corrupted} corrupted tables. `;
+                }
+                
+                if (data.repaired > 0) {
+                    message += `Successfully repaired ${data.repaired} tables. `;
+                }
+                
+                if (data.optimized > 0) {
+                    message += `Optimized ${data.optimized} tables. `;
+                }
+                
+                if (data.failed > 0) {
+                    message += `${data.failed} operations failed.`;
+                }
+                
+                if (data.corrupted === 0) {
+                    message += 'All tables are in optimal condition!';
+                }
+            } else {
+                message = 'No tables were found to analyze.';
+            }
+
+            // Show detailed results
+            let detailsHtml = `<div class="wp-opt-state-success">${message}</div>`;
+            
+            if (data.details && data.details.length > 0) {
+                detailsHtml += `<div class="wp-opt-state-details" style="margin-top: 10px; max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; background: #f9f9f9;">`;
+                detailsHtml += `<strong>Table Analysis Details:</strong><ul style="margin: 5px 0; font-size: 12px;">`;
+                
+                data.details.forEach(detail => {
+                    let statusIcons = '';
+                    if (detail.corrupted) statusIcons += '🔴';
+                    if (detail.repaired) statusIcons += '🛠️';
+                    if (detail.optimized) statusIcons += '⚡';
+                    if (!detail.corrupted && !detail.repaired && !detail.optimized) statusIcons = '✅';
+                    
+                    detailsHtml += `<li>${statusIcons} ${detail.table}: `;
+                    if (detail.corrupted) detailsHtml += 'Corrupted → ';
+                    if (detail.repaired) detailsHtml += 'Repaired ';
+                    if (detail.optimized) detailsHtml += 'Optimized';
+                    if (!detail.corrupted && !detail.repaired && !detail.optimized) detailsHtml += 'Healthy';
+                    if (detail.error) detailsHtml += ` - Error: ${detail.error}`;
+                    detailsHtml += `</li>`;
+                });
+                
+                detailsHtml += `</ul></div>`;
+            }
+            
+            $('#wp-opt-state-table-results').addClass('show').html(detailsHtml).hide().fadeIn(300);
+            showToast(message, data.failed > 0 ? 'warning' : 'success');
+            
+            // Refresh stats
+            setTimeout(loadStats, 1500);
+        }
+        btn.removeClass('loading').prop('disabled', false).text('🛠️ Analyze & Repair Tables');
+    })
+    .fail(function(xhr) {
+        isProcessing = false;
+        if (xhr.status === 429) {
+            showToast('Please wait before analyzing again.', 'error');
+        } else {
+            showToast('Analysis failed', 'error');
+        }
+        btn.removeClass('loading').prop('disabled', false).text('🛠️ Analyze & Repair Tables');
+    });
+});
+
+// Replace the existing autoload optimization handler
+$('#wp-opt-state-optimize-autoload').on('click', function() {
+    if (isProcessing) return;
+    
+    const btn = $(this);
+    isProcessing = true;
+    btn.prop('disabled', true).addClass('loading').text('Optimizing...');
+    
+    $.post(wpOptStateAjax.ajaxurl, {
+        action: 'wp_opt_state_optimize_autoload',
+        nonce: wpOptStateAjax.nonce
+    })
+    .done(function(response) {
+        isProcessing = false;
+        if (response.success) {
+            const data = response.data;
+            let message = '';
+            
+            if (data.optimized > 0) {
+                message = `✓ Optimized ${data.optimized} autoloaded options`;
+                
+                if (data.total_size_reduced > 0) {
+                    // Convert bytes to readable format
+                    const sizeReduced = (data.total_size_reduced / 1024 / 1024).toFixed(2);
+                    message += `, reduced autoload size by ${sizeReduced} MB`;
+                }
+                
+                if (data.skipped > 0) {
+                    message += `, ${data.skipped} essential options preserved`;
+                }
+            } else {
+                message = 'No autoloaded options needed optimization. Your autoloaded options are already optimized!';
+            }
+
+            // Show detailed results
+            let detailsHtml = `<div class="wp-opt-state-success">${message}</div>`;
+            
+            if (data.details && data.details.length > 0 && data.optimized > 0) {
+                detailsHtml += `<div class="wp-opt-state-details" style="margin-top: 10px; max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; background: #f9f9f9;">`;
+                detailsHtml += `<strong>Optimized Options (${data.optimized} total):</strong><ul style="margin: 5px 0; font-size: 12px;">`;
+                
+                // Show first 10 optimized options
+                data.details.slice(0, 10).forEach(detail => {
+                    if (detail.status === 'optimized') {
+                        detailsHtml += `<li>✅ ${detail.option} (${detail.size})</li>`;
+                    }
+                });
+                
+                if (data.optimized > 10) {
+                    detailsHtml += `<li>... and ${data.optimized - 10} more options optimized</li>`;
+                }
+                
+                detailsHtml += `</ul></div>`;
+            }
+            
+            $('#wp-opt-state-table-results').addClass('show').html(detailsHtml).hide().fadeIn(300);
+            showToast(message, 'success');
+            
+            // Refresh stats to show updated autoload info
+            setTimeout(loadStats, 1500);
+        }
+        btn.removeClass('loading').prop('disabled', false).text('💾 Optimize Autoloaded Options');
+    })
+    .fail(function(xhr) {
+        isProcessing = false;
+        if (xhr.status === 429) {
+            showToast('Please wait before optimizing again.', 'error');
+        } else {
+            showToast('Optimization failed', 'error');
+        }
+        btn.removeClass('loading').prop('disabled', false).text('💾 Optimize Autoloaded Options');
+    });
+});
+    
+$('#wp-opt-state-one-click').on('click', function() {
         if (isProcessing) return;
         
         const btn = $(this);
@@ -690,7 +869,7 @@ function displayOptimizationLog(log) {
                 }
                 
                 $('#wp-opt-state-one-click-results').addClass('show').html(html).hide().fadeIn(300);
-                btn.removeClass('loading').prop('disabled', false).text('Optimize Now');
+                btn.removeClass('loading').prop('disabled', false).text('🚀 Optimize Now');
                 setTimeout(loadStats, 1500);
             })
             .fail(function(xhr) {
@@ -700,15 +879,10 @@ function displayOptimizationLog(log) {
                 } else {
                     showToast('Optimization failed', 'error');
                 }
-                btn.removeClass('loading').prop('disabled', false).text('Optimize Now');
+                btn.removeClass('loading').prop('disabled', false).text('🚀 Optimize Now');
             });
         }, false);
     });
-    
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.has('settings-updated') && urlParams.get('settings-updated') === 'true') {
-        showToast('Settings saved successfully!', 'success');
-    }
     
     // Initial load
     loadStats();

@@ -32,28 +32,21 @@ class WP_Optimal_State {
     private $db_backup_manager;
     private $log_option_name = 'wp_opt_state_optimization_log';
     
-    public function __construct() {
-        // Instantiate the backup manager and let it handle its own hooks
-        $this->db_backup_manager = new DB_Backup_Manager();
+public function __construct() {
+    $this->log_file_path = plugin_dir_path(__FILE__) . 'optimization-log.json';
+    $this->db_backup_manager = new DB_Backup_Manager($this->log_file_path);
 
-        add_action('admin_menu', array($this, 'add_admin_menu'));
-        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
-        add_action('plugins_loaded', array($this, 'load_textdomain'));
-        add_action('admin_notices', 'wp_opt_state_admin_notices');
-function wp_opt_state_admin_notices() {
-    if (isset($_GET['page']) && $_GET['page'] === 'wp-optimal-state' && isset($_GET['settings-updated'])) {
-        ?>
-        <div class="notice notice-success is-dismissible">
-            <p><?php esc_html_e('Settings saved successfully!', 'wp-optimal-state'); ?></p>
-        </div>
-        <?php
-    }
+    add_action('admin_menu', array($this, 'add_admin_menu'));
+    add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
+    add_action('plugins_loaded', array($this, 'load_textdomain'));
+    
+    $this->register_ajax_handlers();
+    add_action('wp_opt_state_scheduled_cleanup', array($this, 'run_scheduled_cleanup'));
+    add_action('update_option_wp_opt_state_settings', array($this, 'handle_settings_update'), 10, 3);
+    add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
+    add_action('wp_ajax_wp_opt_state_save_auto_settings', array($this, 'ajax_save_auto_settings'));
+    add_action('init', array($this, 'maybe_reschedule_cron'));
 }
-        $this->register_ajax_handlers();
-        add_action('wp_opt_state_scheduled_cleanup', array($this, 'run_scheduled_cleanup'));
-        add_action('update_option_wp_opt_state_settings', array($this, 'handle_settings_update'), 10, 3);
-        add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
-    }
     
     /**
      * Load plugin text domain for translations
@@ -94,6 +87,33 @@ private function register_ajax_handlers() {
     }
     
     /**
+ * AJAX handler for saving the auto optimization days setting.
+ */
+public function ajax_save_auto_settings() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+        return;
+    }
+
+    $days = isset($_POST['auto_optimize_days']) ? absint($_POST['auto_optimize_days']) : 0;
+
+    $options = get_option($this->option_name, array('auto_optimize_days' => 0));
+    $options['auto_optimize_days'] = min(max($days, 0), 365);
+    
+    // Manually update the option
+    update_option($this->option_name, $options);
+    
+    // Trigger the scheduling logic manually
+    $this->handle_settings_update(null, null, $options);
+
+    wp_send_json_success(array(
+        'message' => __('Automatic optimization setting saved successfully!', 'wp-optimal-state'),
+        'days' => $options['auto_optimize_days']
+    ));
+}
+    
+/**
      * Enqueue combined admin styles and scripts
      */
     public function enqueue_admin_assets($hook) {
@@ -119,10 +139,12 @@ private function register_ajax_handlers() {
         );
         
         // Localize scripts for the Optimizer
-        wp_localize_script('wp-opt-state-admin-script', 'wpOptStateAjax', array(
+        $optimizer_data = array(
             'ajaxurl' => admin_url('admin-ajax.php'),
-            'nonce' => wp_create_nonce($this->nonce_action)
-        ));
+            'nonce' => wp_create_nonce($this->nonce_action),
+            'settings_updated' => (isset($_GET['settings-updated']) && $_GET['settings-updated'] === 'true')
+        );
+        wp_localize_script('wp-opt-state-admin-script', 'wpOptStateAjax', $optimizer_data);
 
         // Localize scripts for the Backup Manager
         wp_localize_script('wp-opt-state-admin-script', 'dbBackupManager', array(
@@ -135,9 +157,13 @@ private function register_ajax_handlers() {
      * Display the main admin page with integrated backup UI
      */
     public function display_admin_page() {
-        if (!current_user_can('manage_options')) {
-            wp_die(esc_html__('You do not have sufficient permissions to access this page.', 'wp-optimal-state'));
-        }
+    if (!current_user_can('manage_options')) {
+        wp_die(esc_html__('You do not have sufficient permissions to access this page.', 'wp-optimal-state'));
+    }
+    
+    // Data for the optimizer settings form
+    $options = get_option($this->option_name, array());
+    $auto_optimize_days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
         
         // Data for the optimizer settings form
         $options = get_option($this->option_name, array());
@@ -149,8 +175,7 @@ private function register_ajax_handlers() {
         <div class="wrap wp-opt-state-wrap">
             <h1 class="wp-opt-state-title"><span class="dashicons dashicons-performance"></span> <?php echo esc_html($this->plugin_name); ?></h1>
                 <div class="db-backup-wrap" style="margin: 0;">
-                    <div class="db-backup-notice" id="backup-notice" style="display:none;"></div>
-					
+                    
 				<div class="wp-opt-state-container">
                 <div class="wp-opt-state-notice">
                     <strong>ℹ️ <?php esc_html_e('Need Help?', 'wp-optimal-state'); ?></strong> <?php esc_html_e('Check out the full plugin manual for detailed instructions and best practices.', 'wp-optimal-state'); ?>
@@ -269,7 +294,8 @@ private function register_ajax_handlers() {
                 
                 <div class="wp-opt-state-card">
                     <h2>🗄️ <?php esc_html_e( '5. Advanced Database Optimization', 'wp-optimal-state'); ?></h2>
-                    <p><?php esc_html_e('Optimize and repair database tables to improve performance', 'wp-optimal-state'); ?></p>
+                    <p><?php esc_html_e('🔹 Optimize and repair database tables to improve performance.', 'wp-optimal-state'); ?><br>
+                    <strong>‼️ Caution</strong>: These operations may make your website <u>unresponsive</u> for a few minutes, especially if your database is large and has never been optimized!
                     <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
                         <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-optimize-tables"><?php esc_html_e('⚡ Optimize All Tables', 'wp-optimal-state'); ?></button>
                         <button class="button wp-opt-state-refresh-stats" id="wp-opt-state-analyze-repair-tables"><?php esc_html_e('🛠️ Analyze & Repair Tables', 'wp-optimal-state'); ?></button>
@@ -279,71 +305,91 @@ private function register_ajax_handlers() {
                     <div style="margin-top: 20px; line-height: 1.7em;">
 <strong>⚡ Optimize Tables</strong>: Runs <u>OPTIMIZE TABLE</u> on all database tables to reclaim space and improve query speed.<br>
 <strong>🛠️ Analyze & Repair</strong>: Checks tables for errors/corruption (<u>CHECK TABLE</u>), then runs <u>REPAIR TABLE</u> to fix issues.<br>
-<strong>💾 Autoloaded Options</strong>: Identifies large autoloaded options and sets them to non-autoload to boost site speed.
+<strong>💾 Autoloaded Options</strong>: Identifies large autoloaded options and sets them to <u>non-autoload</u> to boost site speed.
 </div>
                 </div>
                 
-                <div class="wp-opt-state-card">
-                    <h2><span class="dashicons dashicons-database-export" style="font-size: 24px; height: 24px; width: 19px;"></span>🧹 <?php esc_html_e('6. Automatic Backup and Cleaning', 'wp-optimal-state'); ?></h2>
-                    <form method="post" action="options.php">
-                        <?php settings_fields('wp_opt_state_settings_group'); ?>
-                        <table class="form-table">
-                            <tr>
-                                <th><?php esc_html_e('Run Tasks Automatically Every', 'wp-optimal-state'); ?></th>
-                                <td>
-                                    <input type="number" style="font-weight: bold;" name="<?php echo esc_attr($this->option_name); ?>[auto_optimize_days]" value="<?php echo esc_attr($auto_optimize_days); ?>" min="0" max="365"> <?php echo __('<strong>DAYS</strong> (0 to disable)', 'wp-optimal-state'); ?>
-                                    <p class="description">
-                                        <?php if ($auto_optimize_days > 0): ?>
-                                            ✅ <?php echo sprintf(esc_html__('Automated optimization is enabled and will run every %d days.', 'wp-optimal-state'), $auto_optimize_days); ?>
-                                        <?php else: ?>
-                                            🔴 <?php esc_html_e('Automated optimization is currently disabled.', 'wp-optimal-state'); ?>
-                                        <?php endif; ?>
-                                        <br>
-                                       <?php echo 'ℹ️ ' . __('When enabled, the plugin will automatically: 1. <u>Backup your database</u>;  2. <u>Perform full optimization</u> on the specified schedule.', 'wp-optimal-state'); ?>
-                                    </p>
-                                </td>
-                            </tr>
-                        </table>
-                        <?php submit_button(); ?>
-                    </form>
-                    <div id="wp-opt-state-settings-log"></div>
-                </div>
+<div class="wp-opt-state-card">
+    <h2><span class="dashicons dashicons-database-export" style="font-size: 24px; height: 24px; width: 19px;"></span>🧹 <?php esc_html_e('6. Automatic Backup and Cleaning', 'wp-optimal-state'); ?></h2>
+    <div id="wp-opt-state-auto-settings-form">
+        <table class="form-table">
+            <tr>
+                <th><?php esc_html_e('Run Tasks Automatically Every', 'wp-optimal-state'); ?></th>
+                <td>
+                    <input type="number" style="font-weight: bold;" id="auto_optimize_days" name="<?php echo esc_attr($this->option_name); ?>[auto_optimize_days]" value="<?php echo esc_attr($auto_optimize_days); ?>" min="0" max="365"> <?php echo __('<strong>DAYS</strong> (0 to disable)', 'wp-optimal-state'); ?>
+                    <p class="description">
+                        <?php if ($auto_optimize_days > 0): ?>
+                            <span id="auto-status-enabled">✅ <?php echo sprintf(esc_html__('Automated optimization is enabled and will run every %d days.', 'wp-optimal-state'), $auto_optimize_days); ?></span>
+                            <span id="auto-status-disabled" style="display:none;">🔴 <?php esc_html_e('Automated optimization is currently disabled.', 'wp-optimal-state'); ?></span>
+                        <?php else: ?>
+                            <span id="auto-status-enabled" style="display:none;">✅ <?php echo sprintf(esc_html__('Automated optimization is enabled and will run every %d days.', 'wp-optimal-state'), $auto_optimize_days); ?></span>
+                            <span id="auto-status-disabled">🔴 <?php esc_html_e('Automated optimization is currently disabled.', 'wp-optimal-state'); ?></span>
+                        <?php endif; ?>
+                        <br>
+                       <?php echo 'ℹ️ ' . __('When enabled, the plugin will automatically: 1. <u>Backup your database</u>; 2. <u>Perform One-Click Optimization</u> on the specified schedule.', 'wp-optimal-state'); ?>
+                    </p>
+                </td>
+            </tr>
+        </table>
+        <button type="submit" class="button button-primary" style="font-size: 1.1em; padding: 5px 16px; margin: 8px 0 20px 0;" id="save-auto-optimize-btn">
+            <?php esc_html_e('✓ Save Settings', 'wp-optimal-state'); ?>
+        </button>
+    </div>
+    <div id="wp-opt-state-settings-log"></div>
+</div>
             </div>
         </div>
         <?php
     }
     
-    /**
-     * Log optimization execution
-     */
 /**
- * Log optimization execution
+ * Log optimization execution to file
  */
-private function log_optimization($type = 'scheduled') {
-    $log = get_option($this->log_option_name, array());
-    
-    $operation = ($type === 'scheduled') ? 'Full Optimization + Database Backup' : 'Full Optimization';
+private function log_optimization($type = 'scheduled', $operation = 'One-Click Optimization + Database Backup', $backup_filename = '') {
+    $log_entries = $this->get_optimization_log();
     
     $log_entry = array(
         'timestamp' => current_time('timestamp'),
         'type' => $type,
         'date' => current_time('Y-m-d H:i:s'),
-        'operation' => $operation
+        'operation' => $operation,
+        'backup_filename' => $backup_filename
     );
     
     // Keep only last 20 entries to prevent log from growing too large
-    array_unshift($log, $log_entry);
-    $log = array_slice($log, 0, 20);
+    array_unshift($log_entries, $log_entry);
+    $log_entries = array_slice($log_entries, 0, 30);
     
-    update_option($this->log_option_name, $log, false);
+    // Save to file
+    $this->save_log_to_file($log_entries);
 }
 
-    /**
-     * Get optimization log
-     */
-    private function get_optimization_log() {
-        return get_option($this->log_option_name, array());
+/**
+ * Save log entries to file
+ */
+private function save_log_to_file($log_entries) {
+    $json_data = json_encode($log_entries, JSON_PRETTY_PRINT);
+    if ($json_data !== false) {
+        @file_put_contents($this->log_file_path, $json_data);
     }
+}
+
+/**
+ * Get optimization log from file
+ */
+private function get_optimization_log() {
+    if (!file_exists($this->log_file_path)) {
+        return array();
+    }
+    
+    $json_data = @file_get_contents($this->log_file_path);
+    if ($json_data === false) {
+        return array();
+    }
+    
+    $log_entries = json_decode($json_data, true);
+    return is_array($log_entries) ? $log_entries : array();
+}
     
     /**
      * Set optimization limits for memory and time
@@ -471,23 +517,23 @@ public function ajax_get_stats() {
     /**
      * AJAX handler for one-click optimization
      */
-    public function ajax_one_click_optimize() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-        }
-        
-        $this->set_optimization_limits();
-        
-        $cleaned = $this->perform_optimizations(true); // true for AJAX mode to return data
-        $this->log_optimization('manual');
-        
-        // Clear stats cache after optimization
-        delete_transient('wp_opt_state_stats_cache');
-        
-        wp_send_json_success($cleaned);
+public function ajax_one_click_optimize() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
     }
+    
+    $this->set_optimization_limits();
+    
+    $cleaned = $this->perform_optimizations(true);
+    $this->log_optimization('manual', 'One-Click Optimization');
+    
+    // Clear stats cache after optimization
+    delete_transient('wp_opt_state_stats_cache');
+    
+    wp_send_json_success($cleaned);
+}
     
     /**
      * AJAX handler for getting optimization log
@@ -521,7 +567,7 @@ public function ajax_save_max_backups() {
     
     update_option($this->option_name, $options);
     
-    wp_send_json_success(array('message' => __('Setting saved successfully', 'wp-optimal-state')));
+    wp_send_json_success(array('message' => __('Automatic optimization setting saved successfully!', 'wp-optimal-state')));
 }
     
     /**
@@ -552,128 +598,425 @@ public function ajax_save_max_backups() {
         }
     }
     
-    /**
-     * AJAX handler for optimizing tables
-     */
-    public function ajax_optimize_tables() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-        }
-        
-        $this->set_optimization_limits();
-        
-        $result = $this->perform_optimize_tables(true); // true for AJAX mode
-        
-        // Clear stats cache after optimization
-        delete_transient('wp_opt_state_stats_cache');
-        
-        wp_send_json_success($result);
+/**
+ * Enhanced AJAX handler for optimizing tables
+ */
+public function ajax_optimize_tables() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
     }
     
-    /**
-     * Optimize tables (returns data if $return_data true)
-     */
-    private function perform_optimize_tables($return_data = false) {
-        global $wpdb;
+    $result = $this->perform_optimize_tables(true);
+    
+    // Clear stats cache after optimization
+    delete_transient('wp_opt_state_stats_cache');
+    
+    wp_send_json_success($result);
+}
+    
+/**
+ * Optimize tables with better error handling and progress tracking
+ */
+private function perform_optimize_tables($return_data = false) {
+    global $wpdb;
+    
+    $this->set_optimization_limits();
+    
+    // Get all tables with their current status
+    $tables = $wpdb->get_results("
+        SELECT TABLE_NAME, ENGINE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, DATA_FREE
+        FROM information_schema.TABLES 
+        WHERE table_schema = DATABASE()
+        AND TABLE_TYPE = 'BASE TABLE'
+    ", ARRAY_A);
+    
+    $results = [
+        'optimized' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'reclaimed' => 0,
+        'details' => []
+    ];
+    
+    foreach ($tables as $table) {
+        $table_name = $table['TABLE_NAME'];
+        $initial_overhead = $table['DATA_FREE'] ?: 0;
         
-        $tables = $wpdb->get_results("SHOW TABLES", ARRAY_N);
-        $optimized = 0;
+        // Skip tables that don't need optimization
+        if ($this->should_skip_table_optimization($table)) {
+            $results['skipped']++;
+            $results['details'][] = [
+                'table' => $table_name,
+                'status' => 'skipped',
+                'reason' => 'No overhead or not supported'
+            ];
+            continue;
+        }
         
-        foreach ($tables as $table) {
-            $table_name = $table[0];
-            // SECURITY FIX: Properly escape table names
+        try {
+            // Use proper table escaping
             $escaped_table_name = $wpdb->_escape($table_name);
             $result = $wpdb->query("OPTIMIZE TABLE `$escaped_table_name`");
-            if ($result) $optimized++;
-        }
-        
-        if ($return_data) {
-            return array('optimized' => $optimized);
-        }
-    }
-    
-    /**
-     * AJAX handler for analyze and repair tables
-     */
-    public function ajax_analyze_repair_tables() {
-        check_ajax_referer($this->nonce_action, 'nonce');
-        
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
-        }
-        
-        $this->set_optimization_limits();
-        
-        global $wpdb;
-        
-        $tables = $wpdb->get_results("SHOW TABLES", ARRAY_N);
-        $analyzed = 0;
-        $repaired = 0;
-        
-        foreach ($tables as $table) {
-            $table_name = $table[0];
-            // SECURITY FIX: Properly escape table names
-            $escaped_table_name = $wpdb->_escape($table_name);
             
-            $check = $wpdb->get_row("CHECK TABLE `$escaped_table_name`");
-            $analyzed++;
-            
-            if (strtolower($check->Msg_text) !== 'ok') {
-                $repair = $wpdb->query("REPAIR TABLE `$escaped_table_name`");
-                if ($repair) $repaired++;
+            if ($result !== false) {
+                // Get post-optimization stats
+                $optimized_stats = $wpdb->get_row($wpdb->prepare("
+                    SELECT DATA_FREE 
+                    FROM information_schema.TABLES 
+                    WHERE table_schema = DATABASE() 
+                    AND TABLE_NAME = %s
+                ", $table_name), ARRAY_A);
+                
+                $final_overhead = $optimized_stats['DATA_FREE'] ?: 0;
+                $reclaimed = max(0, $initial_overhead - $final_overhead);
+                
+                $results['optimized']++;
+                $results['reclaimed'] += $reclaimed;
+                $results['details'][] = [
+                    'table' => $table_name,
+                    'status' => 'optimized',
+                    'reclaimed' => size_format($reclaimed, 2),
+                    'initial_overhead' => size_format($initial_overhead, 2)
+                ];
+            } else {
+                $results['failed']++;
+                $results['details'][] = [
+                    'table' => $table_name,
+                    'status' => 'failed',
+                    'error' => $wpdb->last_error
+                ];
             }
+        } catch (Exception $e) {
+            $results['failed']++;
+            $results['details'][] = [
+                'table' => $table_name,
+                'status' => 'error',
+                'error' => $e->getMessage()
+            ];
         }
         
-        // Clear stats cache after repair
-        delete_transient('wp_opt_state_stats_cache');
-        
-        wp_send_json_success(array(
-            'analyzed' => $analyzed,
-            'repaired' => $repaired
-        ));
+        // Prevent server overload with large databases
+        if (count($tables) > 50) {
+            usleep(100000); // 0.1 second delay between large operations
+        }
     }
     
-    /**
-     * AJAX handler for optimizing autoload
-     */
-    public function ajax_optimize_autoload() {
-        check_ajax_referer($this->nonce_action, 'nonce');
+    if ($return_data) {
+        return $results;
+    }
+}
+
+/**
+ * Determine if a table should be skipped for optimization
+ */
+private function should_skip_table_optimization($table) {
+    // Skip views
+    if (isset($table['TABLE_TYPE']) && $table['TABLE_TYPE'] !== 'BASE TABLE') {
+        return true;
+    }
+    
+    // Skip tables with no rows
+    if (empty($table['TABLE_ROWS']) || $table['TABLE_ROWS'] == 0) {
+        return true;
+    }
+    
+    // Skip tables with minimal overhead (less than 1KB)
+    $min_overhead = 1024;
+    if (empty($table['DATA_FREE']) || $table['DATA_FREE'] < $min_overhead) {
+        return true;
+    }
+    
+    // Skip MEMORY tables (they don't benefit from OPTIMIZE)
+    if (isset($table['ENGINE']) && strtoupper($table['ENGINE']) === 'MEMORY') {
+        return true;
+    }
+    
+    return false;
+}
+    
+/**
+ * AJAX handler for analyze and repair tables with better diagnostics
+ */
+public function ajax_analyze_repair_tables() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+    }
+    
+    $this->set_optimization_limits();
+    
+    global $wpdb;
+    
+    $results = [
+        'analyzed' => 0,
+        'repaired' => 0,
+        'corrupted' => 0,
+        'optimized' => 0,
+        'failed' => 0,
+        'details' => []
+    ];
+    
+    // Get all tables with their current status
+    $tables = $wpdb->get_results("
+        SELECT TABLE_NAME, ENGINE, TABLE_ROWS, TABLE_COLLATION
+        FROM information_schema.TABLES 
+        WHERE table_schema = DATABASE()
+        AND TABLE_TYPE = 'BASE TABLE'
+    ", ARRAY_A);
+    
+    foreach ($tables as $table) {
+        $table_name = $table['TABLE_NAME'];
+        $results['analyzed']++;
         
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+        try {
+            // Step 1: Analyze table for corruption
+            $escaped_table_name = $wpdb->_escape($table_name);
+            $check_result = $wpdb->get_results("CHECK TABLE `$escaped_table_name`", ARRAY_A);
+            
+            $needs_repair = false;
+            $corruption_found = false;
+            
+            foreach ($check_result as $check_row) {
+                $msg_type = strtolower($check_row['Msg_type']);
+                $msg_text = strtolower($check_row['Msg_text']);
+                
+                if ($msg_type === 'error' || 
+                    strpos($msg_text, 'corrupt') !== false ||
+                    strpos($msg_text, 'error') !== false) {
+                    $needs_repair = true;
+                    $corruption_found = true;
+                    $results['corrupted']++;
+                    break;
+                }
+            }
+            
+            // Step 2: Repair if needed
+            if ($needs_repair) {
+                $repair_result = $wpdb->get_results("REPAIR TABLE `$escaped_table_name`", ARRAY_A);
+                
+                $repair_success = false;
+                foreach ($repair_result as $repair_row) {
+                    if (strtolower($repair_row['Msg_type']) === 'status' && 
+                        strpos(strtolower($repair_row['Msg_text']), 'ok') !== false) {
+                        $repair_success = true;
+                        $results['repaired']++;
+                        break;
+                    }
+                }
+                
+                if (!$repair_success) {
+                    $results['failed']++;
+                }
+            }
+            
+            // Step 3: Always optimize after repair (or if table is large)
+            if ($needs_repair || $table['TABLE_ROWS'] > 1000) {
+                $optimize_result = $wpdb->query("OPTIMIZE TABLE `$escaped_table_name`");
+                if ($optimize_result) {
+                    $results['optimized']++;
+                }
+            }
+            
+            // Record details
+            $results['details'][] = [
+                'table' => $table_name,
+                'corrupted' => $corruption_found,
+                'repaired' => $needs_repair && isset($repair_success) ? $repair_success : null,
+                'optimized' => $needs_repair || $table['TABLE_ROWS'] > 1000
+            ];
+            
+        } catch (Exception $e) {
+            $results['failed']++;
+            $results['details'][] = [
+                'table' => $table_name,
+                'error' => $e->getMessage()
+            ];
         }
         
-        global $wpdb;
+        // Prevent server overload
+        if (count($tables) > 30) {
+            usleep(150000); // 0.15 second delay
+        }
+    }
+    
+    // Clear stats cache after repair
+    delete_transient('wp_opt_state_stats_cache');
+    
+    wp_send_json_success($results);
+}
+    
+/**
+ * AJAX handler for optimizing autoload with smarter analysis
+ */
+public function ajax_optimize_autoload() {
+    check_ajax_referer($this->nonce_action, 'nonce');
+    
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(__('Unauthorized access', 'wp-optimal-state'));
+    }
+    
+    global $wpdb;
+    
+    $results = [
+        'optimized' => 0,
+        'skipped' => 0,
+        'total_found' => 0,
+        'total_size_reduced' => 0,
+        'details' => []
+    ];
+    
+    // Define thresholds based on site size
+    $site_size_factor = $this->get_site_size_factor();
+    $size_threshold = 1024 * (10 * $site_size_factor); // 10KB * factor
+    $total_autoload_size = 0;
+    
+    // First, analyze autoloaded options
+    $autoload_analysis = $wpdb->get_results("
+        SELECT 
+            option_name,
+            LENGTH(option_value) as option_size,
+            option_value
+        FROM {$wpdb->options} 
+        WHERE autoload = 'yes'
+        ORDER BY LENGTH(option_value) DESC
+    ", ARRAY_A);
+    
+    $results['total_found'] = count($autoload_analysis);
+    
+    // Calculate total autoload size
+    foreach ($autoload_analysis as $option) {
+        $total_autoload_size += $option['option_size'];
+    }
+    
+    // Identify candidates for optimization
+    foreach ($autoload_analysis as $option) {
+        $option_name = $option['option_name'];
+        $option_size = $option['option_size'];
         
-        $threshold = 1024 * 10; // 10KB
+        // Skip essential WordPress options
+        if ($this->is_essential_autoload_option($option_name)) {
+            $results['skipped']++;
+            $results['details'][] = [
+                'option' => $option_name,
+                'size' => size_format($option_size, 2),
+                'status' => 'skipped',
+                'reason' => 'Essential WordPress option'
+            ];
+            continue;
+        }
         
-        $large_options = $wpdb->get_results($wpdb->prepare(
-            "SELECT option_name FROM {$wpdb->options} 
-             WHERE autoload = 'yes' AND LENGTH(option_value) > %d",
-            $threshold
-        ));
+        // Apply optimization criteria
+        $should_optimize = $this->should_optimize_autoload_option($option_name, $option_size, $size_threshold, $total_autoload_size);
         
-        $optimized = 0;
-        
-        foreach ($large_options as $option) {
-            $wpdb->update(
+        if ($should_optimize) {
+            $update_result = $wpdb->update(
                 $wpdb->options,
                 array('autoload' => 'no'),
-                array('option_name' => $option->option_name)
+                array('option_name' => $option_name)
             );
-            $optimized++;
+            
+            if ($update_result !== false) {
+                $results['optimized']++;
+                $results['total_size_reduced'] += $option_size;
+                $results['details'][] = [
+                    'option' => $option_name,
+                    'size' => size_format($option_size, 2),
+                    'status' => 'optimized'
+                ];
+            }
+        } else {
+            $results['skipped']++;
         }
-        
-        // Clear stats cache after optimization
-        delete_transient('wp_opt_state_stats_cache');
-        
-        wp_send_json_success(array(
-            'optimized' => $optimized,
-            'found' => count($large_options)
-        ));
     }
+    
+    // Clear stats cache after optimization
+    delete_transient('wp_opt_state_stats_cache');
+    
+    wp_send_json_success($results);
+}
+
+/**
+ * Determine if an autoload option is essential
+ */
+private function is_essential_autoload_option($option_name) {
+    $essential_options = [
+        'active_plugins',
+        'template',
+        'stylesheet',
+        'current_theme',
+        'theme_mods_',
+        'widget_',
+        'sidebars_widgets',
+        'cron',
+        'rewrite_rules',
+        'wp_user_roles',
+        'blogname',
+        'blogdescription',
+        'siteurl',
+        'home',
+        'admin_email',
+        'WPLANG'
+    ];
+    
+    foreach ($essential_options as $essential) {
+        if (strpos($option_name, $essential) === 0) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Determine if an autoload option should be optimized
+ */
+private function should_optimize_autoload_option($option_name, $option_size, $size_threshold, $total_autoload_size) {
+    // Always optimize very large options (> 100KB)
+    if ($option_size > (1024 * 100)) {
+        return true;
+    }
+    
+    // Optimize options larger than threshold
+    if ($option_size > $size_threshold) {
+        return true;
+    }
+    
+    // Optimize transient-related options that are large
+    if (strpos($option_name, '_transient_') !== false && $option_size > (1024 * 5)) {
+        return true;
+    }
+    
+    // Optimize if this option represents a significant portion of total autoload size
+    if ($total_autoload_size > 0 && ($option_size / $total_autoload_size) > 0.05) {
+        return true; // More than 5% of total autoload size
+    }
+    
+    return false;
+}
+
+/**
+ * Get site size factor for dynamic thresholds
+ */
+private function get_site_size_factor() {
+    global $wpdb;
+    
+    $total_size = $wpdb->get_var("
+        SELECT SUM(DATA_LENGTH + INDEX_LENGTH) 
+        FROM information_schema.TABLES 
+        WHERE table_schema = DATABASE()
+    ");
+    
+    if ($total_size > 100 * 1024 * 1024) { // > 100MB
+        return 2; // Larger threshold for big sites
+    } elseif ($total_size > 50 * 1024 * 1024) { // > 50MB
+        return 1.5;
+    }
+    
+    return 1; // Default for small sites
+}
     
     /**
      * AJAX handler for getting DB size
@@ -697,53 +1040,86 @@ public function ajax_save_max_backups() {
         wp_send_json_success(array('size' => size_format($size, 2)));
     }
     
-    /**
-     * Handle settings update to reschedule cron
-     */
-    public function handle_settings_update($old_value, $new_value, $option) {
-        wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
+/**
+ * Handle settings update to reschedule cron
+ */
+public function handle_settings_update($old_value, $new_value, $option) {
+    wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
+    
+    $days = isset($new_value['auto_optimize_days']) ? intval($new_value['auto_optimize_days']) : 0;
+    
+    if ($days > 0) {
+        $next_run = time() + (1 * DAY_IN_SECONDS);
         
-        $days = isset($new_value['auto_optimize_days']) ? intval($new_value['auto_optimize_days']) : 0;
-        
-        if ($days > 0) {
-            $interval = $days * DAY_IN_SECONDS;
-            $recurrence = ($days == 1) ? 'daily' : (($days == 7) ? 'weekly' : "every_{$days}_days");
-            wp_schedule_event(time() + $interval, $recurrence, 'wp_opt_state_scheduled_cleanup');
+        // Determine recurrence
+        if ($days == 1) {
+            $recurrence = 'daily';
+        } elseif ($days == 7) {
+            $recurrence = 'weekly';
+        } else {
+            $recurrence = "every_{$days}_days";
+            // Make sure the custom interval is registered
+            add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
         }
-        
-        // Clear stats cache when settings change
-        delete_transient('wp_opt_state_stats_cache');
+
+        $scheduled = wp_schedule_event($next_run, $recurrence, 'wp_opt_state_scheduled_cleanup');
+    }
+
+    delete_transient('wp_opt_state_stats_cache');
+}
+    
+/**
+ * Add custom cron intervals
+ */
+public function add_custom_cron_interval($schedules) {
+    $options = get_option($this->option_name, array());
+    $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+    
+    if ($days > 1 && $days != 7) {
+        $schedules["every_{$days}_days"] = array(
+            'interval' => $days * DAY_IN_SECONDS,
+            'display' => sprintf(__('Every %d Days', 'wp-optimal-state'), $days)
+        );
     }
     
-    /**
-     * Add custom cron intervals
-     */
-    public function add_custom_cron_interval($schedules) {
-        $options = get_option($this->option_name);
-        $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
-        
-        if ($days > 1 && $days != 7) {
-            $schedules["every_{$days}_days"] = array(
-                'interval' => $days * DAY_IN_SECONDS,
-                'display' => sprintf(__('Every %d Days', 'wp-optimal-state'), $days)
-            );
-        }
-        
-        return $schedules;
+    return $schedules;
+}
+
+/**
+ * Check and reschedule cron if needed (runs on init)
+ */
+public function maybe_reschedule_cron() {
+    // Only run in admin and for privileged users
+    if (!is_admin() || !current_user_can('manage_options')) {
+        return;
     }
     
-    /**
-     * Run scheduled cleanup (backup + optimize)
-     */
-    public function run_scheduled_cleanup() {
-        $this->set_optimization_limits();
-        $this->db_backup_manager->create_backup_silent();
-        $this->perform_optimizations();
-        $this->log_optimization('scheduled');
-        
-        // Clear stats cache after scheduled cleanup
-        delete_transient('wp_opt_state_stats_cache');
+    $options = get_option($this->option_name, array());
+    $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+    
+    // Check if we have a valid schedule but no cron job
+    if ($days > 0) {
+        $next_scheduled = wp_next_scheduled('wp_opt_state_scheduled_cleanup');
+        if (!$next_scheduled) {
+            // Reschedule the event
+            $this->handle_settings_update(null, $options, $this->option_name);
+            error_log("WP Optimal State: Rescheduled missing cron job");
+        }
     }
+}
+    
+/**
+ * Run scheduled cleanup (backup + optimize)
+ */
+public function run_scheduled_cleanup() {
+    $this->set_optimization_limits();
+    $this->db_backup_manager->create_backup_silent();
+    $this->perform_optimizations();
+    $this->log_optimization('scheduled', 'One-Click Optimization + Database Backup');
+    
+    // Clear stats cache after scheduled cleanup
+    delete_transient('wp_opt_state_stats_cache');
+}
     
     // --- Cleanup Methods (unchanged) ---
     
@@ -867,14 +1243,16 @@ class DB_Backup_Manager {
     
     private $backup_dir;
     private $max_backups;
+    private $log_file_path;
     
-public function __construct() {
-    $this->backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
-    
-    // Get max backups from settings, default to 3
-    $options = get_option('wp_opt_state_settings', array());
-    $this->max_backups = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
-    
+    public function __construct($log_file_path = '') {
+        $this->backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
+        $this->log_file_path = $log_file_path;
+        
+        // Get max backups from settings, default to 3
+        $options = get_option('wp_opt_state_settings', array());
+        $this->max_backups = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
+        
         add_action('wp_ajax_create_backup', array($this, 'ajax_create_backup'));
         add_action('wp_ajax_delete_backup', array($this, 'ajax_delete_backup'));
         add_action('wp_ajax_restore_backup', array($this, 'ajax_restore_backup'));
@@ -1318,10 +1696,10 @@ public function ajax_restore_backup() {
     }
     
     // Check rate limiting
-if (!$this->check_rate_limit('restore_backup')) {
-    wp_send_json_error(array('message' => 'Please wait 30 seconds before restoring another backup.'));
-    return;
-}
+    if (!$this->check_rate_limit('restore_backup')) {
+        wp_send_json_error(array('message' => 'Please wait 30 seconds before restoring another backup.'));
+        return;
+    }
     
     $this->set_backup_limits();
     
@@ -1345,8 +1723,6 @@ if (!$this->check_rate_limit('restore_backup')) {
     }
     
     global $wpdb;
-
-    // --- START: MODIFIED CODE ---
 
     try {
         // Open the backup file for reading instead of loading it all into memory
@@ -1399,12 +1775,13 @@ if (!$this->check_rate_limit('restore_backup')) {
         
         fclose($handle); // Close the file handle
 
-        // --- END: MODIFIED CODE ---
-        
         // Commit changes and re-enable checks
         $wpdb->query('COMMIT');
         $wpdb->query('SET AUTOCOMMIT = 1');
         $wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+        
+        // Log the restore operation
+        $this->log_restore_operation($filename, $executed_queries);
         
         if (!empty($errors)) {
             wp_send_json_error(array(
@@ -1432,6 +1809,43 @@ if (!$this->check_rate_limit('restore_backup')) {
         $wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
         
         wp_send_json_error(array('message' => 'Restore failed: ' . $e->getMessage()));
+    }
+}
+
+/**
+ * Log database restore operation
+ */
+private function log_restore_operation($backup_filename, $queries_executed) {
+    if (empty($this->log_file_path) || !file_exists($this->log_file_path)) {
+        return;
+    }
+    
+    $log_entries = array();
+    $json_data = @file_get_contents($this->log_file_path);
+    if ($json_data !== false) {
+        $log_entries = json_decode($json_data, true);
+        if (!is_array($log_entries)) {
+            $log_entries = array();
+        }
+    }
+    
+    $log_entry = array(
+        'timestamp' => current_time('timestamp'),
+        'type' => 'manual',
+        'date' => current_time('Y-m-d H:i:s'),
+        'operation' => 'Database Backup Restored',
+        'backup_filename' => $backup_filename,
+        'queries_executed' => $queries_executed
+    );
+    
+    // Keep only last 20 entries
+    array_unshift($log_entries, $log_entry);
+    $log_entries = array_slice($log_entries, 0, 20);
+    
+    // Save to file
+    $json_data = json_encode($log_entries, JSON_PRETTY_PRINT);
+    if ($json_data !== false) {
+        @file_put_contents($this->log_file_path, $json_data);
     }
 }
 
@@ -1599,7 +2013,7 @@ function wp_opt_state_activate() {
     add_option('wp_opt_state_settings', $default_settings);
     add_option('wp_opt_state_backup_reminder', 1);
     add_option('wp_opt_state_activation_time', time());
-    add_option('wp_opt_state_optimization_log', array());
+    delete_option('wp_opt_state_optimization_log');
 }
 
 register_deactivation_hook(__FILE__, 'wp_opt_state_deactivate');

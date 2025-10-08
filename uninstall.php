@@ -1,10 +1,11 @@
 <?php
 /**
  * WP Optimal State - Uninstall Script
- * * This file is executed when the plugin is uninstalled.
- * It cleans up all plugin data from the database.
- * * @package WP_Optimal_State
- * @version 1.0.4
+ * This file is executed when the plugin is uninstalled.
+ * It cleans up all plugin data from the database and file system.
+ * 
+ * @package WP_Optimal_State
+ * @version 1.0.7
  */
 
 // Prevent direct access
@@ -22,7 +23,8 @@ $is_multisite = is_multisite();
 
 /**
  * Check if we should remove data on uninstall
- * * This respects the user's choice if they have a setting for data removal.
+ * 
+ * This respects the user's choice if they have a setting for data removal.
  * By default, we remove all plugin data.
  */
 function wp_opt_state_should_remove_data() {
@@ -35,6 +37,72 @@ function wp_opt_state_should_remove_data() {
     
     // Default behavior: remove data
     return true;
+}
+
+/**
+ * Remove database backup files and directory
+ */
+function wp_opt_state_remove_backup_files() {
+    $backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
+    
+    // Check if backup directory exists
+    if (!is_dir($backup_dir)) {
+        return;
+    }
+    
+    // Get all backup files
+    $backup_files = glob($backup_dir . '*.sql');
+    $protection_files = array(
+        $backup_dir . '.htaccess',
+        $backup_dir . 'index.php'
+    );
+    
+    // Delete all backup files
+    if (is_array($backup_files)) {
+        foreach ($backup_files as $file) {
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
+    }
+    
+    // Delete protection files
+    foreach ($protection_files as $file) {
+        if (is_file($file)) {
+            @unlink($file);
+        }
+    }
+    
+    // Remove the backup directory if empty
+    if (is_dir($backup_dir)) {
+        $files = scandir($backup_dir);
+        if (is_array($files) && count($files) <= 2) { // Only . and .. remain
+            @rmdir($backup_dir);
+        }
+    }
+}
+
+/**
+ * Remove optimization log file
+ */
+function wp_opt_state_remove_log_files() {
+    $plugin_dir = plugin_dir_path(__FILE__);
+    $log_file = $plugin_dir . 'optimization-log.json';
+    
+    // Delete the optimization log file if it exists
+    if (file_exists($log_file)) {
+        @unlink($log_file);
+    }
+    
+    // Also check for any other log files in the plugin directory
+    $log_files = glob($plugin_dir . '*.log');
+    if (is_array($log_files)) {
+        foreach ($log_files as $log_file) {
+            if (is_file($log_file)) {
+                @unlink($log_file);
+            }
+        }
+    }
 }
 
 /**
@@ -52,6 +120,7 @@ function wp_opt_state_uninstall_cleanup() {
         'wp_opt_state_last_cleanup',
         'wp_opt_state_stats_cache',
         'wp_opt_state_schedule',
+        'wp_opt_state_optimization_log', // Old log option (if exists)
     );
     
     // Remove options safely
@@ -66,22 +135,38 @@ function wp_opt_state_uninstall_cleanup() {
     $site_transient_pattern = $wpdb->esc_like('_site_transient_wp_opt_state_') . '%';
     $site_timeout_pattern = $wpdb->esc_like('_site_transient_timeout_wp_opt_state_') . '%';
     
-    $transients = $wpdb->get_col($wpdb->prepare(
-        "SELECT option_name 
-         FROM {$wpdb->options} 
-         WHERE option_name LIKE %s 
-         OR option_name LIKE %s
-         OR option_name LIKE %s
-         OR option_name LIKE %s",
-        $transient_pattern,
-        $timeout_pattern,
-        $site_transient_pattern,
-        $site_timeout_pattern
-    ));
+    // Rate limiting transients
+    $rate_limit_patterns = array(
+        $wpdb->esc_like('_transient_wp_opt_state_rate_limit_') . '%',
+        $wpdb->esc_like('_transient_timeout_wp_opt_state_rate_limit_') . '%',
+    );
+    
+    $transient_queries = array(
+        $wpdb->prepare(
+            "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s",
+            $transient_pattern,
+            $timeout_pattern,
+            $site_transient_pattern,
+            $site_timeout_pattern
+        ),
+        $wpdb->prepare(
+            "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+            $rate_limit_patterns[0],
+            $rate_limit_patterns[1]
+        )
+    );
+    
+    $all_transients = array();
+    foreach ($transient_queries as $query) {
+        $results = $wpdb->get_col($query);
+        if (is_array($results)) {
+            $all_transients = array_merge($all_transients, $results);
+        }
+    }
     
     // Delete each transient properly
-    if (is_array($transients) && !empty($transients)) {
-        foreach ($transients as $transient) {
+    if (!empty($all_transients)) {
+        foreach ($all_transients as $transient) {
             if (strpos($transient, '_site_transient_') === 0) {
                 $transient_name = str_replace('_site_transient_timeout_', '', $transient);
                 $transient_name = str_replace('_site_transient_', '', $transient_name);
@@ -109,13 +194,17 @@ function wp_opt_state_uninstall_cleanup() {
         wp_clear_scheduled_hook($hook);
     }
     
+    // Remove any custom user meta
+    $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE 'wp_opt_state_%'");
+    
+    // Remove file-based data
+    wp_opt_state_remove_backup_files();
+    wp_opt_state_remove_log_files();
+    
     // Clear any cached data
     if (function_exists('wp_cache_flush')) {
         wp_cache_flush();
     }
-    
-    // Remove any custom user meta
-    $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE 'wp_opt_state_%'");
     
     /**
      * Fire action hook for developers to add custom cleanup
@@ -130,7 +219,7 @@ function wp_opt_state_multisite_uninstall() {
     global $wpdb;
     
     // Get all blog IDs in the network
-    $blog_ids = $wpdb->get_col("SELECT blog_id FROM {$wpdb->blogs} WHERE archived = 0 AND deleted = 0");
+    $blog_ids = $wpdb->get_col("SELECT blog_id FROM {$wpdb->blogs} WHERE archived = 0 AND deleted = 0 AND spam = 0");
     
     if (!is_array($blog_ids) || empty($blog_ids)) {
         return;
@@ -151,6 +240,9 @@ function wp_opt_state_multisite_uninstall() {
         restore_current_blog();
     }
     
+    // Switch back to original blog
+    switch_to_blog($original_blog_id);
+    
     // Remove network-wide options
     $network_options = array(
         'wp_opt_state_network_settings',
@@ -162,6 +254,10 @@ function wp_opt_state_multisite_uninstall() {
     foreach ($network_options as $option) {
         delete_site_option($option);
     }
+    
+    // Remove network-wide file data
+    wp_opt_state_remove_backup_files();
+    wp_opt_state_remove_log_files();
 }
 
 /**
