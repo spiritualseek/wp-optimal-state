@@ -489,7 +489,7 @@ function displayOptimizationLog(log) {
         log.forEach(entry => {
             const typeClass = entry.type === 'manual' ? 'manual' : 'scheduled';
             const typeLabel = entry.type === 'manual' ? 'Manual' : 'Scheduled';
-            const operation = entry.operation || 'One-Click Optimization';
+            const operation = entry.operation || '🚀 One-Click Optimization';
             html += `<div class="wp-opt-state-log-item">
                     <span class="wp-opt-state-log-date">${entry.date}</span>
                     <span class="wp-opt-state-log-operation">${operation}</span>
@@ -614,7 +614,7 @@ $('#wp-opt-state-optimize-tables').on('click', function() {
     
     const btn = $(this);
     isProcessing = true;
-    btn.prop('disabled', true).addClass('loading').text('Optimizing...');
+    btn.prop('disabled', true).addClass('loading').text('💥 Optimizing...');
     
     $.post(wpOptStateAjax.ajaxurl, {
         action: 'wp_opt_state_optimize_tables',
@@ -686,7 +686,7 @@ $('#wp-opt-state-analyze-repair-tables').on('click', function() {
     
     const btn = $(this);
     isProcessing = true;
-    btn.prop('disabled', true).addClass('loading').text('Analyzing...');
+    btn.prop('disabled', true).addClass('loading').text('🔎 Analyzing...');
     
     $.post(wpOptStateAjax.ajaxurl, {
         action: 'wp_opt_state_analyze_repair_tables',
@@ -775,7 +775,7 @@ $('#wp-opt-state-optimize-autoload').on('click', function() {
     
     const btn = $(this);
     isProcessing = true;
-    btn.prop('disabled', true).addClass('loading').text('Optimizing...');
+    btn.prop('disabled', true).addClass('loading').text('💥 Optimizing...');
     
     $.post(wpOptStateAjax.ajaxurl, {
         action: 'wp_opt_state_optimize_autoload',
@@ -839,7 +839,7 @@ $('#wp-opt-state-optimize-autoload').on('click', function() {
         } else {
             showToast('Optimization failed', 'error');
         }
-        btn.removeClass('loading').prop('disabled', false).text('💾 Optimize Autoloaded Options');
+        btn.removeClass('loading').prop('disabled', false).text('⏳ Optimize Autoloaded Options');
     });
 });
     
