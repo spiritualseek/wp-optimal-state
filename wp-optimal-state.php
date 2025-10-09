@@ -33,8 +33,12 @@ class WP_Optimal_State {
     private $log_option_name = 'wp_opt_state_optimization_log';
     
 public function __construct() {
+    $this->settings_file_path = plugin_dir_path(__FILE__) . 'settings.json';
     $this->log_file_path = plugin_dir_path(__FILE__) . 'optimization-log.json';
-    $this->db_backup_manager = new DB_Backup_Manager($this->log_file_path);
+    
+    // Get settings from the file and pass the max_backups value to the DB_Backup_Manager
+    $settings = $this->get_persistent_settings();
+    $this->db_backup_manager = new DB_Backup_Manager($this, $this->log_file_path, $settings['max_backups']);
 
     add_action('admin_menu', array($this, 'add_admin_menu'));
     add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
@@ -42,10 +46,119 @@ public function __construct() {
     
     $this->register_ajax_handlers();
     add_action('wp_opt_state_scheduled_cleanup', array($this, 'run_scheduled_cleanup'));
-    add_action('update_option_wp_opt_state_settings', array($this, 'handle_settings_update'), 10, 3);
+    // The 'update_option' hook is removed as it's no longer needed for these settings.
     add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
     add_action('wp_ajax_wp_opt_state_save_auto_settings', array($this, 'ajax_save_auto_settings'));
     add_action('init', array($this, 'maybe_reschedule_cron'));
+    add_action('init', array($this, 'protect_settings_file')); // Add security hook
+}
+
+private $settings_file_path;
+
+/**
+ * Get persistent settings from JSON file with validation.
+ */
+private function get_persistent_settings() {
+    $defaults = array(
+        'max_backups' => 3,
+        'auto_optimize_days' => 0
+    );
+
+    if (!file_exists($this->settings_file_path)) {
+        return $defaults;
+    }
+
+    $json_data = @file_get_contents($this->settings_file_path);
+    if ($json_data === false) {
+        return $defaults;
+    }
+
+    $settings = json_decode($json_data, true);
+    if (!is_array($settings)) {
+        return $defaults;
+    }
+    
+    // Validate max_backups: must be between 1 and 10
+    $max_backups = isset($settings['max_backups']) ? absint($settings['max_backups']) : $defaults['max_backups'];
+    if ($max_backups < 1 || $max_backups > 10) {
+        $max_backups = $defaults['max_backups'];
+    }
+
+    // Validate auto_optimize_days: must be between 0 and 365
+    $auto_optimize_days = isset($settings['auto_optimize_days']) ? absint($settings['auto_optimize_days']) : $defaults['auto_optimize_days'];
+    if ($auto_optimize_days < 0 || $auto_optimize_days > 365) {
+        $auto_optimize_days = $defaults['auto_optimize_days'];
+    }
+
+    return array(
+        'max_backups' => $max_backups,
+        'auto_optimize_days' => $auto_optimize_days
+    );
+}
+
+/**
+ * Save persistent settings to JSON file with validation.
+ */
+private function save_persistent_settings($new_settings) {
+    $current_settings = $this->get_persistent_settings();
+    $settings_to_save = array_merge($current_settings, $new_settings);
+
+    // Re-validate before saving to ensure data integrity
+    $settings_to_save['max_backups'] = min(max(absint($settings_to_save['max_backups']), 1), 10);
+    $settings_to_save['auto_optimize_days'] = min(max(absint($settings_to_save['auto_optimize_days']), 0), 365);
+    
+    $json_data = json_encode($settings_to_save, JSON_PRETTY_PRINT);
+    
+    // Use file_put_contents with LOCK_EX for an atomic write operation
+    if ($json_data !== false) {
+        if (@file_put_contents($this->settings_file_path, $json_data, LOCK_EX) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Protects the settings file from direct web access via .htaccess.
+ */
+public function protect_settings_file() {
+    $htaccess_path = plugin_dir_path(__FILE__) . '.htaccess';
+    if (!file_exists($htaccess_path)) {
+        $htaccess_content = "# Protect sensitive plugin files from direct access\n<FilesMatch \"\\.(json)$\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n";
+        @file_put_contents($htaccess_path, $htaccess_content);
+    }
+}
+
+/**
+ * Updates the cron schedule based on the number of days.
+ */
+private function update_cron_schedule($days) {
+    wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
+    
+    $days = intval($days);
+    
+    if ($days > 0) {
+        // Schedule for the correct interval from now.
+        $next_run = time() + ($days * DAY_IN_SECONDS);
+        
+        if ($days == 1) {
+            $recurrence = 'daily';
+        } elseif ($days == 7) {
+            $recurrence = 'weekly';
+        } else {
+            $recurrence = "every_{$days}_days";
+        }
+        wp_schedule_event($next_run, $recurrence, 'wp_opt_state_scheduled_cleanup');
+    }
+}
+
+/**
+ * Public method to trigger a cron reschedule based on saved settings.
+ * This is crucial for re-establishing the schedule after a DB restore.
+ */
+public function reschedule_cron_from_settings() {
+    $settings = $this->get_persistent_settings();
+    $this->update_cron_schedule($settings['auto_optimize_days']);
 }
     
     /**
@@ -98,18 +211,18 @@ public function ajax_save_auto_settings() {
 
     $days = isset($_POST['auto_optimize_days']) ? absint($_POST['auto_optimize_days']) : 0;
 
-    $options = get_option($this->option_name, array('auto_optimize_days' => 0));
-    $options['auto_optimize_days'] = min(max($days, 0), 365);
+    // Save the new setting to the JSON file
+    $this->save_persistent_settings(array('auto_optimize_days' => $days));
+
+    // Update the cron schedule based on the new setting
+    $this->update_cron_schedule($days);
     
-    // Manually update the option
-    update_option($this->option_name, $options);
-    
-    // Trigger the scheduling logic manually
-    $this->handle_settings_update(null, null, $options);
+    // Read the final, validated settings back from the file to send to the frontend
+    $final_settings = $this->get_persistent_settings();
 
     wp_send_json_success(array(
         'message' => __('Automatic optimization setting saved successfully!', 'wp-optimal-state'),
-        'days' => $options['auto_optimize_days']
+        'days' => $final_settings['auto_optimize_days']
     ));
 }
     
@@ -157,21 +270,18 @@ public function ajax_save_auto_settings() {
      * Display the main admin page with integrated backup UI
      */
     public function display_admin_page() {
-    if (!current_user_can('manage_options')) {
-        wp_die(esc_html__('You do not have sufficient permissions to access this page.', 'wp-optimal-state'));
-    }
-    
-    // Data for the optimizer settings form
-    $options = get_option($this->option_name, array());
-    $auto_optimize_days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
-        
-        // Data for the optimizer settings form
-        $options = get_option($this->option_name, array());
-        $auto_optimize_days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+if (!current_user_can('manage_options')) {
+    wp_die(esc_html__('You do not have sufficient permissions to access this page.', 'wp-optimal-state'));
+}
 
-        // Data for the backup manager UI
-        $backups = $this->db_backup_manager->get_backups();
+// Data for the settings form from the persistent JSON file
+$settings = $this->get_persistent_settings();
+$auto_optimize_days = $settings['auto_optimize_days'];
+
+// Data for the backup manager UI
+$backups = $this->db_backup_manager->get_backups();
         ?>
+        
         <div class="wrap wp-opt-state-wrap">
             <h1 class="wp-opt-state-title"><span class="dashicons dashicons-performance"></span> <?php echo esc_html($this->plugin_name); ?></h1>
                 <div class="db-backup-wrap" style="margin: 0;">
@@ -197,12 +307,12 @@ public function ajax_save_auto_settings() {
         </label>
         <select style="font-weight: bold; width: 100px;" name="max_backups_setting" id="max_backups_setting">
             <?php
-            $current_max = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
-            for ($i = 1; $i <= 10; $i++) {
-                $selected = ($i === $current_max) ? 'selected' : '';
-                echo '<option value="' . esc_attr($i) . '" ' . $selected . '>' . esc_html($i) . '</option>';
-            }
-            ?>
+$current_max_backups = $settings['max_backups'];
+for ($i = 1; $i <= 10; $i++) {
+    $selected = ($i === $current_max_backups) ? 'selected' : '';
+    echo '<option value="' . esc_attr($i) . '" ' . $selected . '>' . esc_html($i) . '</option>';
+}
+?>
         </select>
         <button type="button" class="button" id="save-max-backups-btn" style="margin-left: 10px;">
             <?php esc_html_e('✔ Save', 'wp-optimal-state'); ?>
@@ -345,7 +455,7 @@ public function ajax_save_auto_settings() {
 /**
  * Log optimization execution to file
  */
-private function log_optimization($type = 'scheduled', $operation = 'One-Click Optimization + Database Backup', $backup_filename = '') {
+private function log_optimization($type = 'scheduled', $operation = '🚀 One-Click Optimization + Database Backup 💾', $backup_filename = '') {
     $log_entries = $this->get_optimization_log();
     
     $log_entry = array(
@@ -527,7 +637,7 @@ public function ajax_one_click_optimize() {
     $this->set_optimization_limits();
     
     $cleaned = $this->perform_optimizations(true);
-    $this->log_optimization('manual', 'One-Click Optimization');
+    $this->log_optimization('manual', '🚀 One-Click Optimization');
     
     // Clear stats cache after optimization
     delete_transient('wp_opt_state_stats_cache');
@@ -559,15 +669,12 @@ public function ajax_save_max_backups() {
         wp_send_json_error(array('message' => __('Unauthorized access', 'wp-optimal-state')));
     }
     
-    $max_backups = isset($_POST['max_backups']) ? intval($_POST['max_backups']) : 5;
-    $max_backups = min(max($max_backups, 1), 10);
+    $max_backups = isset($_POST['max_backups']) ? intval($_POST['max_backups']) : 3;
     
-    $options = get_option($this->option_name, array());
-    $options['max_backups'] = $max_backups;
+    // Save the new setting to the JSON file
+    $this->save_persistent_settings(array('max_backups' => $max_backups));
     
-    update_option($this->option_name, $options);
-    
-    wp_send_json_success(array('message' => __('Automatic optimization setting saved successfully!', 'wp-optimal-state')));
+    wp_send_json_success(array('message' => __('Maximum backups setting saved successfully!', 'wp-optimal-state')));
 }
     
     /**
@@ -1044,36 +1151,14 @@ private function get_site_size_factor() {
  * Handle settings update to reschedule cron
  */
 public function handle_settings_update($old_value, $new_value, $option) {
-    wp_clear_scheduled_hook('wp_opt_state_scheduled_cleanup');
-    
-    $days = isset($new_value['auto_optimize_days']) ? intval($new_value['auto_optimize_days']) : 0;
-    
-    if ($days > 0) {
-        $next_run = time() + (1 * DAY_IN_SECONDS);
-        
-        // Determine recurrence
-        if ($days == 1) {
-            $recurrence = 'daily';
-        } elseif ($days == 7) {
-            $recurrence = 'weekly';
-        } else {
-            $recurrence = "every_{$days}_days";
-            // Make sure the custom interval is registered
-            add_filter('cron_schedules', array($this, 'add_custom_cron_interval'));
-        }
-
-        $scheduled = wp_schedule_event($next_run, $recurrence, 'wp_opt_state_scheduled_cleanup');
-    }
-
-    delete_transient('wp_opt_state_stats_cache');
 }
     
 /**
  * Add custom cron intervals
  */
 public function add_custom_cron_interval($schedules) {
-    $options = get_option($this->option_name, array());
-    $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+    $settings = $this->get_persistent_settings();
+    $days = $settings['auto_optimize_days'];
     
     if ($days > 1 && $days != 7) {
         $schedules["every_{$days}_days"] = array(
@@ -1089,22 +1174,17 @@ public function add_custom_cron_interval($schedules) {
  * Check and reschedule cron if needed (runs on init)
  */
 public function maybe_reschedule_cron() {
-    // Only run in admin and for privileged users
     if (!is_admin() || !current_user_can('manage_options')) {
         return;
     }
     
-    $options = get_option($this->option_name, array());
-    $days = isset($options['auto_optimize_days']) ? intval($options['auto_optimize_days']) : 0;
+    $settings = $this->get_persistent_settings();
+    $days = $settings['auto_optimize_days'];
     
-    // Check if we have a valid schedule but no cron job
-    if ($days > 0) {
-        $next_scheduled = wp_next_scheduled('wp_opt_state_scheduled_cleanup');
-        if (!$next_scheduled) {
-            // Reschedule the event
-            $this->handle_settings_update(null, $options, $this->option_name);
-            error_log("WP Optimal State: Rescheduled missing cron job");
-        }
+    if ($days > 0 && !wp_next_scheduled('wp_opt_state_scheduled_cleanup')) {
+        // Reschedule the event if it's missing
+        $this->update_cron_schedule($days);
+        error_log("WP Optimal State: Rescheduled missing cron job.");
     }
 }
     
@@ -1115,7 +1195,7 @@ public function run_scheduled_cleanup() {
     $this->set_optimization_limits();
     $this->db_backup_manager->create_backup_silent();
     $this->perform_optimizations();
-    $this->log_optimization('scheduled', 'One-Click Optimization + Database Backup');
+    $this->log_optimization('scheduled', '🚀 One-Click Optimization + Database Backup 💾');
     
     // Clear stats cache after scheduled cleanup
     delete_transient('wp_opt_state_stats_cache');
@@ -1241,24 +1321,28 @@ public function run_scheduled_cleanup() {
  */
 class DB_Backup_Manager {
     
+    private $main_plugin;
     private $backup_dir;
     private $max_backups;
     private $log_file_path;
     
-    public function __construct($log_file_path = '') {
-        $this->backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
-        $this->log_file_path = $log_file_path;
-        
-        // Get max backups from settings, default to 3
-        $options = get_option('wp_opt_state_settings', array());
-        $this->max_backups = isset($options['max_backups']) ? intval($options['max_backups']) : 3;
-        
-        add_action('wp_ajax_create_backup', array($this, 'ajax_create_backup'));
-        add_action('wp_ajax_delete_backup', array($this, 'ajax_delete_backup'));
-        add_action('wp_ajax_restore_backup', array($this, 'ajax_restore_backup'));
-        add_action('init', array($this, 'handle_download_backup'));
-        add_action('init', array($this, 'protect_backup_directory'));
+public function __construct(WP_Optimal_State $main_plugin, $log_file_path = '', $max_backups_setting = 3) {
+    $this->main_plugin = $main_plugin;
+    $this->backup_dir = WP_CONTENT_DIR . '/uploads/db-backups/';
+    $this->log_file_path = $log_file_path;
+    
+    // Use the passed max backups setting, with validation and a fallback default.
+    $this->max_backups = intval($max_backups_setting);
+    if ($this->max_backups < 1 || $this->max_backups > 10) {
+        $this->max_backups = 3; // Enforce default if the value is somehow invalid
     }
+    
+    add_action('wp_ajax_create_backup', array($this, 'ajax_create_backup'));
+    add_action('wp_ajax_delete_backup', array($this, 'ajax_delete_backup'));
+    add_action('wp_ajax_restore_backup', array($this, 'ajax_restore_backup'));
+    add_action('init', array($this, 'handle_download_backup'));
+    add_action('init', array($this, 'protect_backup_directory'));
+}
     
     /**
      * Protect backup directory with .htaccess
@@ -1796,12 +1880,14 @@ public function ajax_restore_backup() {
             wp_send_json_error(array('message' => 'No queries were executed. The backup file might be empty or corrupted.'));
         }
         
-        delete_transient('wp_opt_state_stats_cache');
-        
-        wp_send_json_success(array(
-            'message' => 'Database restored successfully! ' . $executed_queries . ' queries executed.',
-            'executed' => $executed_queries
-        ));
+$this->main_plugin->reschedule_cron_from_settings();
+
+delete_transient('wp_opt_state_stats_cache');
+
+wp_send_json_success(array(
+    'message' => 'Database restored successfully! ' . $executed_queries . ' queries executed.',
+    'executed' => $executed_queries
+));
         
     } catch (Exception $e) {
         $wpdb->query('ROLLBACK');
@@ -1833,7 +1919,7 @@ private function log_restore_operation($backup_filename, $queries_executed) {
         'timestamp' => current_time('timestamp'),
         'type' => 'manual',
         'date' => current_time('Y-m-d H:i:s'),
-        'operation' => 'Database Backup Restored',
+        'operation' => '🔄 Database Backup Restored',
         'backup_filename' => $backup_filename,
         'queries_executed' => $queries_executed
     );
@@ -2004,16 +2090,18 @@ new WP_Optimal_State();
 // Activation and deactivation hooks
 register_activation_hook(__FILE__, 'wp_opt_state_activate');
 function wp_opt_state_activate() {
-    $default_settings = array(
-        'schedule' => 'disabled',
-        'keep_revisions' => 5,
-        'auto_optimize_days' => 0,
-        'optimize_images' => 0
-    );
-    add_option('wp_opt_state_settings', $default_settings);
-    add_option('wp_opt_state_backup_reminder', 1);
+    // Other activation options can be set here if needed
     add_option('wp_opt_state_activation_time', time());
-    delete_option('wp_opt_state_optimization_log');
+    
+    // Ensure the settings file exists on activation with safe default values
+    $settings_file = plugin_dir_path(__FILE__) . 'settings.json';
+    if (!file_exists($settings_file)) {
+        $default_settings = array(
+            'max_backups' => 3,
+            'auto_optimize_days' => 0
+        );
+        @file_put_contents($settings_file, json_encode($default_settings, JSON_PRETTY_PRINT));
+    }
 }
 
 register_deactivation_hook(__FILE__, 'wp_opt_state_deactivate');
